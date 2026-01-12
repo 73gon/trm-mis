@@ -30,6 +30,11 @@ class GraphTRM(nn.Module):
         # If not provided, will be computed per-batch as fallback
         self.pos_weight = config.get("pos_weight", None)
 
+        # --- Loss Weights (centralized for easy experimentation) ---
+        # These should be tuned so that weighted losses have similar magnitudes
+        # Professor's advice: bce_loss and feasibility_loss should be ~same magnitude
+        self.feasibility_weight = config.get("feasibility_weight", 50.0)
+
         # --- Encoder (X -> Embedding) ---
         self.x_embed = nn.Linear(input_dim, hidden_dim)
         self.x_norm = nn.LayerNorm(hidden_dim)
@@ -148,19 +153,8 @@ class GraphTRM(nn.Module):
         edge_violations = probs_for_loss[src] * probs_for_loss[dst]
         feasibility_loss = edge_violations.mean() if edge_violations.numel() > 0 else torch.tensor(0.0, device=x.device)
 
-        # Combined loss with feasibility weight
-        # Reduced from 2.0 to allow better recall while maintaining feasibility
-        feasibility_weight = 1.0
-
-        # Sparsity loss: encourage selecting fewer nodes (prevent greedy behavior)
-        # Average probability should be close to true fraction
-        with torch.no_grad():
-            true_sparsity = (labels.sum() / labels.numel()).clamp(min=0.01, max=0.99)
-        pred_sparsity = probs_for_loss.mean()
-        sparsity_loss = (pred_sparsity - true_sparsity) ** 2
-        sparsity_weight = 0.3  # Reduced slightly
-
-        loss = bce_loss + feasibility_weight * feasibility_loss + sparsity_weight * sparsity_loss
+        # Combined loss: only BCE + feasibility (sparsity loss removed - it had no effect in ablation)
+        loss = bce_loss + self.feasibility_weight * feasibility_loss
 
         # Metrics
         with torch.no_grad():
@@ -205,7 +199,12 @@ class GraphTRM(nn.Module):
                 "loss_total": loss.detach(),
                 "loss_bce": bce_loss.detach(),
                 "loss_feasibility": feasibility_loss.detach(),
-                "loss_sparsity": sparsity_loss.detach(),
+                # Raw (unweighted) loss magnitudes for tuning loss weights
+                # Professor's advice: bce_loss_raw and feasibility_loss_raw should be ~same magnitude
+                "loss_bce_raw": bce_loss.detach(),
+                "loss_feasibility_raw": feasibility_loss.detach(),
+                # Weighted feasibility loss (what actually contributes to total loss)
+                "loss_feasibility_weighted": (self.feasibility_weight * feasibility_loss).detach(),
                 "acc": acc,
                 "f1": f1,
                 "precision": precision,

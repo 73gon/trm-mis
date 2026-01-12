@@ -6,7 +6,7 @@ from torch.utils.data import IterableDataset, get_worker_info
 from torch_geometric.data import Data, Batch
 
 class MISDatasetConfig:
-    def __init__(self, dataset_paths, global_batch_size, rank=0, num_replicas=1, seed=42, epoch=0, drop_last=True, **kwargs):
+    def __init__(self, dataset_paths, global_batch_size, rank=0, num_replicas=1, seed=42, epoch=0, drop_last=True, val_split=0.1, **kwargs):
         self.dataset_paths = dataset_paths
         self.global_batch_size = global_batch_size
         self.rank = rank
@@ -14,24 +14,39 @@ class MISDatasetConfig:
         self.seed = seed
         self.epoch = epoch  # For per-epoch shuffling
         self.drop_last = drop_last  # Drop partial batches to avoid gradient variance
+        self.val_split = val_split  # Fraction of data for validation (0.1 = 10%)
 
 class MISDataset(IterableDataset):
     def __init__(self, config: MISDatasetConfig, split: str = "train"):
         super().__init__()
         self.config = config
-        self.split = split
+        self.split = split  # "train" or "val"
 
         # 1. Find all shards
-        self.shards = []
+        all_shards = []
         for path in config.dataset_paths:
             # We assume shards are directly in the path or a subdir
             # Adjust pattern if your shards are in "train" subdir
             search_path = os.path.join(path, "mis_shard_*.pt")
             found = sorted(glob.glob(search_path))
-            self.shards.extend(found)
+            all_shards.extend(found)
 
-        if not self.shards:
+        if not all_shards:
             raise FileNotFoundError(f"No mis_shard_*.pt files found in {config.dataset_paths}")
+
+        # 2. Split shards into train/val based on val_split
+        # Use deterministic split based on seed for reproducibility
+        rng = np.random.RandomState(config.seed)
+        indices = np.arange(len(all_shards))
+        rng.shuffle(indices)
+        
+        val_count = max(1, int(len(all_shards) * config.val_split))
+        if split == "val":
+            shard_indices = indices[:val_count]
+        else:  # train
+            shard_indices = indices[val_count:]
+        
+        self.shards = [all_shards[i] for i in sorted(shard_indices)]
 
         # Metadata for the trainer (dummy values to satisfy interfaces)
         self.metadata = type('Metadata', (), {})()
