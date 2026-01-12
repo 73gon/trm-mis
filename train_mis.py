@@ -205,10 +205,9 @@ def main():
         data_paths=["data/mis-10k"],
         val_split=0.1,  # 10% for validation
         arch=ArchConfig(),
-        # Loss weights - tune these so BCE and weighted feasibility are ~same magnitude
+        # Loss weights - tune feasibility_weight so BCE and weighted feasibility are ~same magnitude
         loss=LossConfig(
-            feasibility_weight=50.0,  # Try: 1.0, 5.0, 10.0, 20.0, 50.0
-            sparsity_weight=0.3,     # Try: 0.0, 0.3, 1.0 (0.0 for ablation)
+            feasibility_weight=50.0,  # Try: 1.0, 5.0, 10.0, 20.0, 50.0, 100.0
         ),
     )
 
@@ -219,7 +218,7 @@ def main():
         print(f"GPUs: {world_size}")
         print(f"Config: LR={cfg.lr}, WD={cfg.weight_decay}, Betas=({cfg.beta1}, {cfg.beta2})")
         print(f"Arch: Dim={cfg.arch.hidden_dim}, Layers={cfg.arch.num_layers}, Cycles={cfg.arch.cycles}")
-        print(f"Loss Weights: feasibility={cfg.loss.feasibility_weight}, sparsity={cfg.loss.sparsity_weight}")
+        print(f"Loss Weights: feasibility={cfg.loss.feasibility_weight}")
         print(f"Validation: {cfg.val_split*100:.0f}% of data")
         os.makedirs(cfg.checkpoint_path, exist_ok=True)
 
@@ -253,7 +252,6 @@ def main():
     model_config_dict["input_dim"] = train_dataset.metadata.input_dim
     model_config_dict["pos_weight"] = train_dataset.metadata.pos_weight
     model_config_dict["feasibility_weight"] = cfg.loss.feasibility_weight
-    model_config_dict["sparsity_weight"] = cfg.loss.sparsity_weight
 
     if rank == 0:
         print(f"Train shards: {len(train_dataset.shards)}, Val shards: {len(val_dataset.shards)}")
