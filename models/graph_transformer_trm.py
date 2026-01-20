@@ -412,7 +412,7 @@ class GraphTransformerTRM(nn.Module):
             step_feas = []
 
         # 3. Compute loss and metrics
-        logits_clamped = y_new.squeeze(-1)
+        logits = y_new.squeeze(-1)
 
         # BCE loss - use pos_weight as a SCALAR, not expanded tensor
         # pos_weight > 1 increases the penalty for false negatives (missing MIS nodes)
@@ -426,16 +426,16 @@ class GraphTransformerTRM(nn.Module):
 
         # Weighted BCE for training (accounts for class imbalance)
         bce_loss = F.binary_cross_entropy_with_logits(
-            logits_clamped,
+            logits,
             labels,
-            pos_weight=pos_weight,  # Scalar, NOT expanded
+            pos_weight=pos_weight,
         )
 
         # Unweighted BCE for monitoring
-        bce_loss_unweighted = F.binary_cross_entropy_with_logits(logits_clamped, labels)
+        bce_loss_unweighted = F.binary_cross_entropy_with_logits(logits, labels)
 
         # Feasibility loss
-        probs = torch.sigmoid(logits_clamped)
+        probs = torch.sigmoid(logits)
         src, dst = edge_index[0], edge_index[1]
         edge_violations = probs[src] * probs[dst]
         feasibility_loss = edge_violations.mean() if edge_violations.numel() > 0 else torch.tensor(0.0, device=x.device)

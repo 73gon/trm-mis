@@ -241,7 +241,7 @@ class LossConfig(BaseModel):
     pos_weight: float = 1.0
 
     # Feasibility loss weight: penalizes selecting adjacent nodes
-    feasibility_weight: float = 0.5
+    feasibility_weight: float = 0.0
 
 
 class ArchConfig(BaseModel):
