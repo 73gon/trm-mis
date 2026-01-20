@@ -10,8 +10,6 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 import wandb
-
-# --- Import our new modules ---
 from dataset.mis_dataset import MISDataset, MISDatasetConfig
 from models.ema import EMAHelper
 from models.graph_transformer_trm import GraphTransformerTRM
@@ -19,65 +17,6 @@ from models.graph_transformer_trm import GraphTransformerTRM
 # ============================================================================
 # UTILITY FUNCTIONS
 # ============================================================================
-
-
-def compute_feasibility_diagnostics(probs, edge_index, labels):
-    """
-    Compute feasibility diagnostics to assess if feasibility loss is working.
-
-    Tracks predictions BEFORE post-processing to see if the model
-    naturally learns to produce feasible solutions.
-
-    Returns:
-        - violations: Count of edges where both endpoints selected
-        - violation_rate: violations / total_edges (0-1)
-        - feasibility: 1 - violation_rate (higher = better)
-    """
-    preds_binary = (probs > 0.5).float()
-    src, dst = edge_index[0], edge_index[1]
-
-    # Count violations in predictions (before post-processing)
-    pred_mask = preds_binary == 1
-    if pred_mask.sum() > 0 and edge_index.size(1) > 0:
-        violations = (pred_mask[src] & pred_mask[dst]).sum().float().item()
-    else:
-        violations = 0.0
-
-    # Feasibility metrics
-    # Feasibility = 1 - (edge_violations / total_edges)
-    # This correctly normalizes violations by total edges in graph
-    violations_count = violations
-    total_edges = max(edge_index.size(1), 1)
-    violation_rate = violations / total_edges
-    feasibility = 1.0 - min(violation_rate, 1.0)
-
-    # Size metrics
-    size = preds_binary.sum().item()
-    optimal_size = labels.sum().item()
-
-    return {
-        "violations": violations_count,
-        "violation_rate": violation_rate,
-        "feasibility": feasibility,
-        "size": size,
-        "optimal_size": optimal_size,
-    }
-
-
-def count_parameters(model):
-    """Count model parameters and return detailed breakdown"""
-    total_params = sum(p.numel() for p in model.parameters())
-
-    # Per-module breakdown
-    breakdown = {}
-    for name, module in model.named_children():
-        params = sum(p.numel() for p in module.parameters())
-        breakdown[name] = params
-
-    return {
-        "total_params": total_params,
-        "breakdown": breakdown,
-    }
 
 
 def greedy_decode(probs, edge_index, num_nodes):
@@ -312,7 +251,6 @@ class ArchConfig(BaseModel):
     # Matches 'L_layers' from your TRM config
     num_layers: int = 2
     # TRM recursion: H_cycles * L_cycles = total thinking steps
-    # H_cycles=2, L_cycles=6 is optimal for gradient flow
     L_cycles: int = 6
     H_cycles: int = 2
     dropout: float = 0.2  # Dropout in GPS layers
@@ -326,13 +264,12 @@ class Config(BaseModel):
     global_batch_size: int = 256
 
     # Training
-    lr: float = 0.0001  # Lower LR for stability with deep recursion
+    lr: float = 0.0001
     lr_min_ratio: float = 0.1  # Minimum LR ratio for cosine schedule
     lr_warmup_steps: int = 50
     epochs: int = 1000
     seed: int = 0  # Matches your config
 
-    # Optimizer - Matches 'cfg_pretrain' Llama-style settings
     weight_decay: float = 0.0
     beta1: float = 0.9
     beta2: float = 0.95
@@ -343,8 +280,6 @@ class Config(BaseModel):
 
     # Model
     arch: ArchConfig = ArchConfig()
-
-    # Loss function weights (all loss-related configuration)
     loss: LossConfig = LossConfig()
 
     # Postprocessing - When False, model must learn to produce valid MIS directly - When True, greedy decode post-processes raw predictions
@@ -480,13 +415,9 @@ def main():
 
     # Count and log model parameters (Task 1.2)
     if rank == 0:
-        param_info = count_parameters(model)
+        total_params = sum(p.numel() for p in model.parameters())
         print("\n📊 Model Size:")
-        print(f"  Total Parameters: {param_info['total_params']:,} ({param_info['total_params'] / 1e6:.2f}M)")
-        print("  Breakdown:")
-        for name, count in param_info["breakdown"].items():
-            print(f"    {name}: {count:,}")
-        print()
+        print(f"  Total Parameters: {total_params:,} ({total_params / 1e6:.2f}M)")
 
     if world_size > 1:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[int(os.environ["LOCAL_RANK"])])
@@ -495,17 +426,13 @@ def main():
     # Initialize wandb after model creation to include param count
     if rank == 0:
         wandb_config = cfg.model_dump()
-        wandb_config["model_params"] = param_info
+        wandb_config["model_params"] = total_params
         wandb.init(project=cfg.project_name, name=cfg.run_name, config=wandb_config)
 
         # Log model architecture info
         wandb.log(
             {
-                "model/total_params": param_info["total_params"],
-                "model/hidden_dim": cfg.arch.hidden_dim,
-                "model/num_layers": cfg.arch.num_layers,
-                "model/H_cycles": cfg.arch.H_cycles,
-                "model/L_cycles": cfg.arch.L_cycles,
+                "model/total_params": total_params,
             }
         )
 
@@ -643,13 +570,6 @@ def main():
                 )
 
                 if step % cfg.log_every == 0:
-                    # Compute feasibility diagnostics
-                    feas_diag = compute_feasibility_diagnostics(
-                        final_preds["preds"].squeeze(),
-                        batch["edge_index"],
-                        batch["y"].float(),
-                    )
-
                     wandb.log(
                         {
                             # Standard metrics
@@ -671,21 +591,12 @@ def main():
                             "train/optimal_size": pp_metrics["optimal_size"],
                             "train/gap": pp_metrics["gap"],
                             "train/gap_ratio": pp_metrics["gap_ratio"],
-                            # These tell us if feasibility loss is working
-                            "train/violations": feas_diag["violations"],
-                            "train/violation_rate": feas_diag["violation_rate"],
-                            "train/diag_feasibility": feas_diag["feasibility"],
                             # Training info
                             "train/grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
                             "epoch": epoch,
                             "lr": current_lr,
                         }
                     )
-
-                    # Log per-step accuracies if available
-                    for key in final_metrics:
-                        if key.startswith("step_") and key.endswith("_acc"):
-                            wandb.log({f"train/{key}": final_metrics[key].item()})
 
         if rank == 0:
             pbar.close()

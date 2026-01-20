@@ -105,7 +105,7 @@ def compute_node_features(edge_index, num_nodes, x_original):
     min_neighbor_deg = np.zeros(num_nodes, dtype=np.float32)
     core_number = np.zeros(num_nodes, dtype=np.float32)
 
-    # A. Raw degree
+    # Raw degree
     degrees = dict(G.degree())
     for node, deg in degrees.items():
         raw_degree[node] = deg
@@ -114,12 +114,12 @@ def compute_node_features(edge_index, num_nodes, x_original):
     max_deg = max(raw_degree.max(), 1)
     raw_degree_norm = raw_degree / max_deg
 
-    # C. Clustering coefficient
+    # Clustering coefficient
     clustering_dict = nx.clustering(G)
     for node, cc in clustering_dict.items():
         clustering[node] = cc
 
-    # E. Local degree statistics
+    # Local degree statistics
     for node in range(num_nodes):
         neighbors = list(G.neighbors(node))
         if len(neighbors) > 0:
@@ -129,7 +129,7 @@ def compute_node_features(edge_index, num_nodes, x_original):
             min_neighbor_deg[node] = np.min(neighbor_degs) / max_deg
         # else: stays 0
 
-    # F. Core number (k-core)
+    # Core number (k-core)
     try:
         core_dict = nx.core_number(G)
         max_core = max(core_dict.values()) if core_dict else 1
@@ -141,7 +141,7 @@ def compute_node_features(edge_index, num_nodes, x_original):
         pass
 
     # =========================================================================
-    # G. RELATIVE PE: Shortest path statistics (node-level aggregation)
+    # RELATIVE PE: Shortest path statistics (node-level aggregation)
     # =========================================================================
     # Compute shortest path distances and aggregate to per-node statistics
     avg_sp_dist = np.zeros(num_nodes, dtype=np.float32)  # Average shortest path

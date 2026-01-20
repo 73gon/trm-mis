@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GINConv, global_add_pool
+from torch_geometric.nn import GINConv
 
 # Helper MLP for GIN with proper initialization and LayerNorm for stability
 def make_mlp(in_channels, hidden_channels, out_channels, num_layers=2):

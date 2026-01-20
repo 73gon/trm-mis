@@ -505,8 +505,7 @@ class GraphTransformerTRM(nn.Module):
         # Update carry - detach for next supervision step
         H_step += 1
 
-        # Early stopping: if q_hat > threshold, we can stop
-        # This implements the TRM early-stopping mechanism
+        # Early stopping: if q_hat > threshold, we can stop - This implements the TRM early-stopping mechanism
         early_stop_threshold = self.config.get("early_stop_threshold", 0.9)
         all_finish = (q_hat > early_stop_threshold).item()
 
