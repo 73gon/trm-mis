@@ -153,7 +153,7 @@ class GraphTRM(nn.Module):
         edge_violations = probs_for_loss[src] * probs_for_loss[dst]
         feasibility_loss = edge_violations.mean() if edge_violations.numel() > 0 else torch.tensor(0.0, device=x.device)
 
-        # Combined loss: only BCE + feasibility (sparsity loss removed - it had no effect in ablation)
+        # Combined loss: only BCE + feasibility
         loss = bce_loss + self.feasibility_weight * feasibility_loss
 
         # Metrics
