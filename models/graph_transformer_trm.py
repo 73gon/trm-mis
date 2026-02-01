@@ -60,7 +60,7 @@ class GraphTransformerTRM(nn.Module):
         H_cycles: Deep recursion steps (default: 3)
         dropout: Dropout rate (default: 0.1)
         use_degree_init: Use degree-based y_init (default: True)
-        feasibility_weight: Feasibility loss weight (default: 50.0)
+        feasibility_weight: Feasibility loss weight (default: 1.0)
     """
 
     def __init__(self, config):
@@ -87,7 +87,8 @@ class GraphTransformerTRM(nn.Module):
 
         # Loss weights
         self.pos_weight = config.get("pos_weight", None)
-        self.feasibility_weight = config.get("feasibility_weight", 50.0)
+        self.feasibility_weight = config.get("feasibility_weight", 1.0)
+        self.feasibility_loss_type = config.get("feasibility_loss_type", "soft")  # "soft" or "hinge"
 
         # =====================================================================
         # FEATURE EMBEDDINGS
@@ -323,9 +324,9 @@ class GraphTransformerTRM(nn.Module):
         solved = False
         total_latent_step = 0
 
-        for h_cycle in range(self.H_cycles):
+        for _ in range(self.H_cycles):
             # Run L_cycles of latent recursion, checking after EACH latent step
-            for l_cycle in range(self.L_cycles):
+            for _ in range(self.L_cycles):
                 z = self.latent_step(x_emb, y, z, edge_index, batch_vec)
                 total_latent_step += 1
 
@@ -431,13 +432,18 @@ class GraphTransformerTRM(nn.Module):
             pos_weight=pos_weight,
         )
 
-        # Unweighted BCE for monitoring
-        bce_loss_unweighted = F.binary_cross_entropy_with_logits(logits, labels)
-
         # Feasibility loss
         probs = torch.sigmoid(logits)
         src, dst = edge_index[0], edge_index[1]
-        edge_violations = probs[src] * probs[dst]
+        # Feasibility loss: penalize edges where both endpoints are predicted as selected
+        if self.feasibility_loss_type == "hinge":
+            # Hinge loss: only penalize when BOTH endpoints > 0.5 (would be selected)
+            # This focuses gradient on actual violations, not all edges
+            # relu(p - 0.5) is 0 if p < 0.5, else (p - 0.5)
+            edge_violations = F.relu(probs[src] - 0.5) * F.relu(probs[dst] - 0.5)
+        else:
+            # Soft loss: penalize all edges proportionally (original behavior)
+            edge_violations = probs[src] * probs[dst]
         feasibility_loss = edge_violations.mean() if edge_violations.numel() > 0 else torch.tensor(0.0, device=x.device)
 
         loss = bce_loss + self.feasibility_weight * feasibility_loss
@@ -450,14 +456,6 @@ class GraphTransformerTRM(nn.Module):
             correct = (preds_binary == labels).float()
             confidence = torch.abs(probs - 0.5) * 2  # 0-1 scale
             q_hat = (correct * confidence).mean()  # Average confidence on correct predictions
-
-            tp = (preds_binary * labels).sum().float()
-            fp = (preds_binary * (1 - labels)).sum().float()
-            fn = ((1 - preds_binary) * labels).sum().float()
-
-            precision = tp / (tp + fp + 1e-8)
-            recall = tp / (tp + fn + 1e-8)
-            f1 = 2 * (precision * recall) / (precision + recall + 1e-8)
 
             num_pred_1s = preds_binary.sum()
             num_true_1s = labels.sum()
@@ -480,13 +478,8 @@ class GraphTransformerTRM(nn.Module):
             metrics = {
                 "loss_total": loss.detach(),
                 "loss_bce": bce_loss.detach(),
-                "loss_bce_unweighted": bce_loss_unweighted.detach(),
-                "loss_feasibility_unweighted": feasibility_loss.detach(),
                 "loss_feasibility": (self.feasibility_weight * feasibility_loss).detach(),
                 "acc": acc,
-                "f1": f1,
-                "precision": precision,
-                "recall": recall,
                 "num_pred_1s": num_pred_1s,
                 "num_true_1s": num_true_1s,
                 "set_size_ratio": set_size_ratio,
