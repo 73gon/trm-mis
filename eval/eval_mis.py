@@ -1,53 +1,18 @@
-import torch
-import os
-import glob
 import argparse
+import glob
+import os
+
 import numpy as np
-from tqdm import tqdm
+import torch
 from torch.utils.data import DataLoader
+from tqdm import tqdm
+
 import wandb
 
 # Imports from your project
 from dataset.mis_dataset import MISDataset, MISDatasetConfig
-from models.graph_trm import GraphTRM
-
-
-def greedy_decode(probs, edge_index, num_nodes):
-    """
-    Turns probabilities into a valid Independent Set using a greedy strategy.
-    1. Sort nodes by probability (highest first).
-    2. Pick the best node.
-    3. Remove its neighbors.
-    4. Repeat.
-
-    Returns: (set_size, selected_nodes_set)
-    """
-    probs = probs.cpu().numpy()
-    edge_index = edge_index.cpu().numpy()
-
-    # Create adjacency list
-    adj = {i: set() for i in range(num_nodes)}
-    for u, v in zip(edge_index[0], edge_index[1]):
-        adj[u].add(v)
-        adj[v].add(u)
-
-    # Sort nodes by probability (descending)
-    sorted_nodes = np.argsort(-probs)
-
-    selected_set = set()
-    blocked_nodes = set()
-
-    for node in sorted_nodes:
-        if node in blocked_nodes:
-            continue
-
-        selected_set.add(node)
-        blocked_nodes.add(node)
-
-        for neighbor in adj[node]:
-            blocked_nodes.add(neighbor)
-
-    return len(selected_set), selected_set
+from models.graph_trm_functions import GraphTRM
+from models.pp import greedy_decode
 
 
 def validate_independent_set(selected_set, edge_index):
@@ -68,7 +33,7 @@ def compute_metrics(preds_binary, labels, edge_index):
 
     precision = (tp / (tp + fp + 1e-8)).item()
     recall = (tp / (tp + fn + 1e-8)).item()
-    f1 = (2 * precision * recall / (precision + recall + 1e-8))
+    f1 = 2 * precision * recall / (precision + recall + 1e-8)
 
     # Set size metrics
     num_pred_1s = preds_binary.sum().item()
@@ -76,7 +41,7 @@ def compute_metrics(preds_binary, labels, edge_index):
     set_size_ratio = num_pred_1s / (num_true_1s + 1e-8)
 
     # Feasibility (before greedy decode)
-    pred_mask = (preds_binary == 1)
+    pred_mask = preds_binary == 1
     if pred_mask.sum() > 0 and edge_index.size(1) > 0:
         src, dst = edge_index[0], edge_index[1]
         violations = (pred_mask[src] & pred_mask[dst]).sum().float()
@@ -97,23 +62,16 @@ def compute_metrics(preds_binary, labels, edge_index):
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate MIS model")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/mis/epoch_99.pt",
-                        help="Path to checkpoint")
-    parser.add_argument("--data_path", type=str, default="data/test_mis",
-                        help="Path to test data")
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/mis/epoch_99.pt", help="Path to checkpoint")
+    parser.add_argument("--data_path", type=str, default="data/test_mis", help="Path to test data")
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--num_layers", type=int, default=2)
     parser.add_argument("--cycles", type=int, default=18)
-    parser.add_argument("--max_samples", type=int, default=999999,
-                        help="Maximum samples to evaluate (default: all)")
-    parser.add_argument("--batch_size", type=int, default=64,
-                        help="Batch size for evaluation (increase for speed)")
-    parser.add_argument("--wandb", action="store_true",
-                        help="Log to wandb")
-    parser.add_argument("--wandb_project", type=str, default="MIS-TRM",
-                        help="Wandb project name")
-    parser.add_argument("--wandb_run_name", type=str, default=None,
-                        help="Wandb run name (default: eval_<checkpoint>)")
+    parser.add_argument("--max_samples", type=int, default=999999, help="Maximum samples to evaluate (default: all)")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for evaluation (increase for speed)")
+    parser.add_argument("--wandb", action="store_true", help="Log to wandb")
+    parser.add_argument("--wandb_project", type=str, default="MIS-TRM", help="Wandb project name")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="Wandb run name (default: eval_<checkpoint>)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -134,10 +92,7 @@ def main():
         args.data_path = "data/mis-10k"
 
     # Load Data
-    ds_config = MISDatasetConfig(
-        dataset_paths=[args.data_path],
-        global_batch_size=args.batch_size
-    )
+    ds_config = MISDatasetConfig(dataset_paths=[args.data_path], global_batch_size=args.batch_size)
 
     try:
         dataset = MISDataset(ds_config)
@@ -148,12 +103,7 @@ def main():
     dataloader = DataLoader(dataset, batch_size=None, num_workers=0)
 
     # Load Model
-    model_config = {
-        "input_dim": dataset.metadata.input_dim,
-        "hidden_dim": args.hidden_dim,
-        "num_layers": args.num_layers,
-        "cycles": args.cycles
-    }
+    model_config = {"input_dim": dataset.metadata.input_dim, "hidden_dim": args.hidden_dim, "num_layers": args.num_layers, "cycles": args.cycles}
     model = GraphTRM(model_config).to(device)
 
     if os.path.exists(args.checkpoint):
@@ -195,8 +145,7 @@ def main():
                 break
 
             # Move to device
-            batch_dict = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                         for k, v in batch.items()}
+            batch_dict = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
             # Inference
             carry = model.initial_carry(batch_dict)
@@ -253,29 +202,33 @@ def main():
             all_metrics["optimal_size"].append(gt_size)
 
             # Update progress bar with running averages
-            pbar.set_postfix({
-                "approx_greedy": f"{np.mean(all_metrics['approx_ratio_greedy']):.4f}",
-                "f1": f"{np.mean(all_metrics['f1']):.4f}",
-                "feasibility": f"{np.mean(all_metrics['feasibility_raw']):.4f}",
-            })
+            pbar.set_postfix(
+                {
+                    "approx_greedy": f"{np.mean(all_metrics['approx_ratio_greedy']):.4f}",
+                    "f1": f"{np.mean(all_metrics['f1']):.4f}",
+                    "feasibility": f"{np.mean(all_metrics['feasibility_raw']):.4f}",
+                }
+            )
 
             # Log to wandb after each batch (creates smooth curves)
             if args.wandb:
-                wandb.log({
-                    "eval/approx_ratio_greedy": greedy_approx,
-                    "eval/f1": raw_metrics["f1"],
-                    "eval/precision": raw_metrics["precision"],
-                    "eval/recall": raw_metrics["recall"],
-                    "eval/feasibility_raw": raw_metrics["feasibility_raw"],
-                    "eval/feasibility_greedy": 1.0 if is_valid else 0.0,
-                    "eval/set_size_ratio": raw_metrics["set_size_ratio"],
-                    "eval/sample_num": sample_count,
-                })
+                wandb.log(
+                    {
+                        "eval/approx_ratio_greedy": greedy_approx,
+                        "eval/f1": raw_metrics["f1"],
+                        "eval/precision": raw_metrics["precision"],
+                        "eval/recall": raw_metrics["recall"],
+                        "eval/feasibility_raw": raw_metrics["feasibility_raw"],
+                        "eval/feasibility_greedy": 1.0 if is_valid else 0.0,
+                        "eval/set_size_ratio": raw_metrics["set_size_ratio"],
+                        "eval/sample_num": sample_count,
+                    }
+                )
 
     # Compute final statistics
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("EVALUATION RESULTS")
-    print("="*60)
+    print("=" * 60)
 
     results = {}
     for key, values in all_metrics.items():
@@ -291,8 +244,7 @@ def main():
     print(f"\n📊 KEY METRICS (n={sample_count} samples):")
     print("-" * 50)
 
-    key_metrics = ["approx_ratio_greedy", "pred_size_vs_opt", "f1", "precision", "recall",
-                   "feasibility_raw", "feasibility_greedy", "set_size_ratio"]
+    key_metrics = ["approx_ratio_greedy", "pred_size_vs_opt", "f1", "precision", "recall", "feasibility_raw", "feasibility_greedy", "set_size_ratio"]
 
     for key in key_metrics:
         if key in results:
@@ -328,7 +280,7 @@ def main():
         print(f"\n✅ Results logged to wandb: {args.wandb_project}")
         wandb.finish()
 
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
 
 
 if __name__ == "__main__":

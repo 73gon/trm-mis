@@ -18,7 +18,7 @@ import glob
 # Add workspace root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from models.graph_trm import GraphTRM
+from models.graph_trm_functions import GraphTRM
 
 
 def greedy_decode(probs, edge_index, num_nodes):

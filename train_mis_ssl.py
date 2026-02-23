@@ -1,3 +1,21 @@
+"""
+Self-Supervised Training for Maximum Independent Set (MIS)
+
+This training script uses self-supervised learning - NO ground truth labels needed!
+
+The model learns to find MIS solutions through two loss signals:
+1. Feasibility Loss: Penalize selecting adjacent nodes (exponential penalty)
+2. Selection Loss: Encourage selecting as many nodes as possible
+
+Key differences from supervised version:
+- No BCE loss (no labels)
+- No accuracy metrics (no ground truth to compare against)
+- No opt_size, gap, approx_ratio (all require ground truth)
+- Metrics focus on: pred_size, feasibility, num_violations
+
+The architecture and training loop remain similar to the supervised version.
+"""
+
 import math
 import os
 from typing import List
@@ -11,8 +29,8 @@ from tqdm import tqdm
 import wandb
 from dataset.mis_dataset import MISDataset, MISDatasetConfig
 from models.ema import EMAHelper
-from models.graph_transformer_trm import GraphTransformerTRM
-from models.metrics import compute_metrics, compute_pp_metrics
+from models.graph_transformer_trm_ssl import GraphTransformerTRM_SSL
+from models.metrics_ssl import compute_metrics_ssl, compute_pp_metrics_ssl
 
 # ============================================================================
 # CONFIGURATION CLASSES
@@ -20,19 +38,22 @@ from models.metrics import compute_metrics, compute_pp_metrics
 
 
 class LossConfig(BaseModel):
-    # BCE loss weight for positive class (accounts for class imbalance)
-    # pos_weight = neg_count / pos_count
-    pos_weight: float = 1.0
+    """Self-supervised loss configuration"""
 
-    # Feasibility loss weight: penalizes selecting adjacent nodes
-    feasibility_weight: float = 0.0
+    # Exponential penalty parameter (mu)
+    # Higher = stricter constraint enforcement, but harder to optimize
+    # Lower = softer constraints, easier optimization but may have more violations
+    mu: float = 5.0
 
-    # Feasibility loss type: "soft" or "hinge" - hinge gives better accuracy, soft gives guaranteed feasibility
-    feasibility_loss_type: str = "hinge"
+    # Weight for feasibility loss (exponential penalty term)
+    feasibility_weight: float = 2.0
+
+    # Weight for selection loss (maximize set size term)
+    selection_weight: float = 5.0
 
 
 class ArchConfig(BaseModel):
-    name: str = "graph_trm"
+    name: str = "graph_trm_ssl"
     # Matches 'hidden_size' (set to 256 to be safe on GPU, 512 is heavy for graphs)
     hidden_dim: int = 256
     # Matches 'L_layers' from your TRM config
@@ -77,8 +98,8 @@ class Config(BaseModel):
 
     # Logging
     project_name: str = "MIS-TRM"
-    run_name: str = "mis_trm_hinge_w0"
-    checkpoint_path: str = "checkpoints/mis"
+    run_name: str = "mis_trm_ssl_s5_f1_log"
+    checkpoint_path: str = "checkpoints/mis_ssl"
     log_every: int = 1
 
     # Validation
@@ -118,12 +139,12 @@ def main():
 
     if rank == 0:
         print("=" * 70)
-        print("MIS-TRM Training")
+        print("MIS-TRM Self-Supervised Training")
         print("=" * 70)
         print(f"GPUs: {world_size}")
         print(f"Config: LR={cfg.lr}, WD={cfg.weight_decay}, Betas=({cfg.beta1}, {cfg.beta2}), GradClip={cfg.grad_clip}")
         print(f"Arch: Dim={cfg.arch.hidden_dim}, Layers={cfg.arch.num_layers}, H={cfg.arch.H_cycles}, L={cfg.arch.L_cycles}")
-        print(f"Loss: feasibility_weight={cfg.loss.feasibility_weight}, loss_type={cfg.loss.feasibility_loss_type}")
+        print(f"Loss (SSL): mu={cfg.loss.mu}, feasibility_w={cfg.loss.feasibility_weight}, selection_w={cfg.loss.selection_weight}")
         print(f"Validation: {cfg.val_split * 100:.0f}% of data")
         pp_mode = "ON (greedy decode)" if cfg.use_postprocessing else "OFF (raw predictions)"
         print(f"Postprocessing: {pp_mode}")
@@ -132,6 +153,7 @@ def main():
     torch.manual_seed(cfg.seed + rank)
 
     # 2. Data - Create train and validation datasets
+    # Note: We still use the same dataset, but we won't use the labels for training
 
     train_ds_config = MISDatasetConfig(
         dataset_paths=cfg.data_paths,
@@ -155,53 +177,52 @@ def main():
     )
     val_dataset = MISDataset(val_ds_config, split="val")
 
-    # Pass 'input_dim', 'pos_weight', and loss weights from config to model
+    # Build model config
     model_config_dict = cfg.arch.model_dump()
     model_config_dict["input_dim"] = train_dataset.metadata.input_dim
-    model_config_dict["pos_weight"] = train_dataset.metadata.pos_weight
+    model_config_dict["pe_input_dim"] = train_dataset.metadata.pe_dim
+
+    # Self-supervised loss parameters
+    model_config_dict["mu"] = cfg.loss.mu
     model_config_dict["feasibility_weight"] = cfg.loss.feasibility_weight
-    model_config_dict["pe_input_dim"] = train_dataset.metadata.pe_dim  # Laplacian PE dimension
-
-    if rank == 0:
-        print("\\n📊 Dataset Summary:")
-        print(f"  Total shards used: {len(train_dataset.shards)}")
-        print(f"  Training graphs: {train_dataset.num_graphs}")
-        print(f"  Validation graphs: {val_dataset.num_graphs}")
-        print(f"  Val split: {cfg.val_split * 100:.0f}% ({val_dataset.num_graphs}/{train_dataset.num_graphs + val_dataset.num_graphs} graphs)")
-        print(f"  Class imbalance: pos_weight={train_dataset.metadata.pos_weight:.2f}, class_ratio={train_dataset.metadata.class_ratio:.2%}")
-        print(f"  Features: input_dim={train_dataset.metadata.input_dim}, pe_dim={train_dataset.metadata.pe_dim}")
-
-    train_dataloader = DataLoader(train_dataset, batch_size=None, num_workers=0)
-    val_dataloader = DataLoader(val_dataset, batch_size=None, num_workers=0)
-
-    # 3. Model configuration - all values from Config classes
-    model_config_dict["pos_weight"] = cfg.loss.pos_weight
-    model_config_dict["feasibility_weight"] = cfg.loss.feasibility_weight
-    model_config_dict["feasibility_loss_type"] = cfg.loss.feasibility_loss_type
+    model_config_dict["selection_weight"] = cfg.loss.selection_weight
     model_config_dict["dropout"] = cfg.arch.dropout
     model_config_dict["attn_dropout"] = cfg.arch.attn_dropout
 
     if rank == 0:
-        print("\n🚀 Model Configuration:")
-        print(f"  pos_weight: {cfg.loss.pos_weight}")
+        print("\n📊 Dataset Summary:")
+        print(f"  Total shards used: {len(train_dataset.shards)}")
+        print(f"  Training graphs: {train_dataset.num_graphs}")
+        print(f"  Validation graphs: {val_dataset.num_graphs}")
+        print(f"  Val split: {cfg.val_split * 100:.0f}% ({val_dataset.num_graphs}/{train_dataset.num_graphs + val_dataset.num_graphs} graphs)")
+        print(f"  Features: input_dim={train_dataset.metadata.input_dim}, pe_dim={train_dataset.metadata.pe_dim}")
+        print("  Note: Labels exist in dataset but NOT used for training (self-supervised)")
+
+    train_dataloader = DataLoader(train_dataset, batch_size=None, num_workers=0)
+    val_dataloader = DataLoader(val_dataset, batch_size=None, num_workers=0)
+
+    if rank == 0:
+        print("\n🚀 Model Configuration (Self-Supervised):")
+        print(f"  mu (penalty param): {cfg.loss.mu}")
         print(f"  feasibility_weight: {cfg.loss.feasibility_weight}")
-        print(f"  feasibility_loss_type: {cfg.loss.feasibility_loss_type}")
+        print(f"  selection_weight: {cfg.loss.selection_weight}")
         print(f"  dropout: {cfg.arch.dropout}")
         print(f"  attn_dropout: {cfg.arch.attn_dropout}")
         print(f"  Training on {len(train_dataset.shards)} shards")
 
-    model = GraphTransformerTRM(model_config_dict).cuda()
+    # 3. Create model
+    model = GraphTransformerTRM_SSL(model_config_dict).cuda()
     raw_model = model
 
-    # Initialize EMA (Exponential Moving Average) model
+    # Initialize EMA
     ema_helper = None
     if cfg.use_ema:
         ema_helper = EMAHelper(mu=cfg.ema_decay)
         ema_helper.register(model)
         if rank == 0:
-            print(f"📈 EMA enabled with decay={cfg.ema_decay}")
+            print(f"  EMA enabled with decay={cfg.ema_decay}")
 
-    # Count and log model parameters (Task 1.2)
+    # Count model parameters
     if rank == 0:
         total_params = sum(p.numel() for p in model.parameters())
         print("\n📊 Model Size:")
@@ -211,18 +232,14 @@ def main():
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[int(os.environ["LOCAL_RANK"])])
         raw_model = model.module
 
-    # Initialize wandb after model creation to include param count
+    # Initialize wandb
     if rank == 0:
         wandb_config = cfg.model_dump()
         wandb_config["model_params"] = total_params
+        wandb_config["training_mode"] = "self-supervised"
         wandb.init(project=cfg.project_name, name=cfg.run_name, config=wandb_config)
 
-        # Log model architecture info
-        wandb.log(
-            {
-                "model/total_params": total_params,
-            }
-        )
+        wandb.log({"model/total_params": total_params})
 
     # Optimizer
     optimizer = torch.optim.AdamW(
@@ -232,9 +249,9 @@ def main():
         betas=(cfg.beta1, cfg.beta2),
     )
 
-    # 4. Calculate actual steps for LR scheduling (based on real graph count)
+    # 4. Calculate steps for LR scheduling
     steps_per_epoch = train_dataset.num_graphs // cfg.global_batch_size
-    val_steps_per_epoch = (val_dataset.num_graphs + cfg.global_batch_size - 1) // cfg.global_batch_size  # ceil division
+    val_steps_per_epoch = (val_dataset.num_graphs + cfg.global_batch_size - 1) // cfg.global_batch_size
     total_steps = steps_per_epoch * cfg.epochs
 
     # 5. Training Loop
@@ -249,27 +266,27 @@ def main():
 
         if rank == 0:
             print(f"\n{'=' * 70}")
-            print(f"Epoch {epoch + 1}/{cfg.epochs} - Training")
+            print(f"Epoch {epoch + 1}/{cfg.epochs} - Training (Self-Supervised)")
             print(f"{'=' * 70}")
             pbar = tqdm(total=steps_per_epoch, desc="Train")
 
-        # Accumulators for epoch-level metrics (raw model metrics - always computed)
+        # Accumulators for epoch-level metrics (self-supervised)
         epoch_metrics = {
             "loss_total": 0,
-            "loss_bce": 0,
             "loss_feasibility": 0,
-            "opt_size": 0,
+            "loss_selection": 0,
             "pred_size": 0,
+            "feasibility": 0,
+            "opt_size": 0,
             "gap": 0,
             "approx_ratio": 0,
-            "feasibility": 0,
         }
-        # Accumulators for pp metrics (only used when use_postprocessing=True)
+        # PP metrics (when use_postprocessing=True)
         epoch_pp_metrics = {
             "pp_pred_size": 0,
+            "pp_feasibility": 0,
             "pp_gap": 0,
             "pp_approx_ratio": 0,
-            "pp_feasibility": 0,
         }
         count = 0
 
@@ -287,7 +304,7 @@ def main():
             for param_group in optimizer.param_groups:
                 param_group["lr"] = current_lr
 
-            # Move batch to GPU
+            # Move batch to GPU (labels present but not used)
             batch = {k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
             # Initialize Carry
@@ -312,16 +329,23 @@ def main():
 
             # Backward
             optimizer.zero_grad()
-            final_loss.backward()
+
+            # Gradient clipping
+            if cfg.grad_clip > 0:
+                final_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            else:
+                final_loss.backward()
+
             optimizer.step()
 
-            # Update EMA model after each optimizer step
+            # Update EMA
             if ema_helper is not None:
                 ema_helper.update(raw_model)
 
-            # Compute raw metrics (always)
+            # Compute metrics (labels used for comparison only, not training)
             with torch.no_grad():
-                raw_metrics = compute_metrics(
+                raw_metrics = compute_metrics_ssl(
                     final_preds["preds"].squeeze(),
                     batch["edge_index"],
                     batch["y"].float(),
@@ -329,9 +353,8 @@ def main():
                     ptr=batch["ptr"],
                 )
 
-                # Compute pp metrics only when use_postprocessing is True
                 if cfg.use_postprocessing:
-                    pp_metrics = compute_pp_metrics(
+                    pp_metrics = compute_pp_metrics_ssl(
                         final_preds["preds"].squeeze(),
                         batch["edge_index"],
                         batch["y"].float(),
@@ -339,22 +362,21 @@ def main():
                         ptr=batch["ptr"],
                     )
 
-            # Accumulate raw metrics (always)
+            # Accumulate metrics
             epoch_metrics["loss_total"] += final_metrics["loss_total"].item()
-            epoch_metrics["loss_bce"] += final_metrics["loss_bce"].item()
             epoch_metrics["loss_feasibility"] += final_metrics["loss_feasibility"].item()
-            epoch_metrics["opt_size"] += raw_metrics["opt_size"]
+            epoch_metrics["loss_selection"] += final_metrics["loss_selection"].item()
             epoch_metrics["pred_size"] += raw_metrics["pred_size"]
+            epoch_metrics["feasibility"] += raw_metrics["feasibility"]
+            epoch_metrics["opt_size"] += raw_metrics["opt_size"]
             epoch_metrics["gap"] += raw_metrics["gap"]
             epoch_metrics["approx_ratio"] += raw_metrics["approx_ratio"]
-            epoch_metrics["feasibility"] += raw_metrics["feasibility"]
 
-            # Accumulate pp metrics (only when use_postprocessing=True)
             if cfg.use_postprocessing:
                 epoch_pp_metrics["pp_pred_size"] += pp_metrics["pp_pred_size"]
+                epoch_pp_metrics["pp_feasibility"] += pp_metrics["pp_feasibility"]
                 epoch_pp_metrics["pp_gap"] += pp_metrics["pp_gap"]
                 epoch_pp_metrics["pp_approx_ratio"] += pp_metrics["pp_approx_ratio"]
-                epoch_pp_metrics["pp_feasibility"] += pp_metrics["pp_feasibility"]
 
             count += 1
 
@@ -363,36 +385,36 @@ def main():
                 pbar.set_postfix(
                     {
                         "loss": f"{final_metrics['loss_total'].item():.4f}",
-                        "bce": f"{final_metrics['loss_bce'].item():.4f}",
+                        "feas": f"{raw_metrics['feasibility']:.3f}",
+                        "size": f"{raw_metrics['pred_size']:.1f}",
                     }
                 )
 
                 if step % cfg.log_every == 0:
-                    # Always log raw metrics
                     log_data = {
-                        # Loss metrics
+                        # Loss metrics (self-supervised)
                         "train/loss_total": final_metrics["loss_total"].item(),
-                        "train/loss_bce": final_metrics["loss_bce"].item(),
                         "train/loss_feasibility": final_metrics["loss_feasibility"].item(),
-                        # Raw model metrics (can have violations, approx_ratio > 1)
-                        "train/opt_size": raw_metrics["opt_size"],
+                        "train/loss_selection": final_metrics["loss_selection"].item(),
+                        # Raw model metrics
                         "train/pred_size": raw_metrics["pred_size"],
+                        "train/feasibility": raw_metrics["feasibility"],
+                        # Comparison metrics (for visualization only)
+                        "train/opt_size": raw_metrics["opt_size"],
                         "train/gap": raw_metrics["gap"],
                         "train/approx_ratio": raw_metrics["approx_ratio"],
-                        "train/feasibility": raw_metrics["feasibility"],
                         # Training info
                         "epoch": epoch,
                         "lr": current_lr,
                     }
 
-                    # Add pp metrics when use_postprocessing is True
                     if cfg.use_postprocessing:
                         log_data.update(
                             {
                                 "train/pp_pred_size": pp_metrics["pp_pred_size"],
+                                "train/pp_feasibility": pp_metrics["pp_feasibility"],
                                 "train/pp_gap": pp_metrics["pp_gap"],
                                 "train/pp_approx_ratio": pp_metrics["pp_approx_ratio"],
-                                "train/pp_feasibility": pp_metrics["pp_feasibility"],
                             }
                         )
 
@@ -404,8 +426,8 @@ def main():
             # Log epoch-level training metrics
             n = max(count, 1)
 
-            print(f"\n📈 Training Epoch {epoch + 1} Summary:")
-            print(f"   Loss: {epoch_metrics['loss_total'] / n:.4f} (BCE: {epoch_metrics['loss_bce'] / n:.4f}, Feas: {epoch_metrics['loss_feasibility'] / n:.4f})")
+            print(f"\n📈 Training Epoch {epoch + 1} Summary (Self-Supervised):")
+            print(f"   Loss: {epoch_metrics['loss_total'] / n:.4f} (Feas: {epoch_metrics['loss_feasibility'] / n:.4f}, Sel: {epoch_metrics['loss_selection'] / n:.4f})")
             print("  Raw Metrics:")
             print(f"    Pred Size: {epoch_metrics['pred_size'] / n:.1f} / Opt Size: {epoch_metrics['opt_size'] / n:.1f}")
             print(f"    Gap: {epoch_metrics['gap'] / n:.2f}, Approx Ratio: {epoch_metrics['approx_ratio'] / n:.4f}")
@@ -413,31 +435,29 @@ def main():
 
             if cfg.use_postprocessing:
                 print("  PP Metrics (greedy-decoded):")
+                print(f"    PP Pred Size: {epoch_pp_metrics['pp_pred_size'] / n:.1f}")
                 print(f"    PP Gap: {epoch_pp_metrics['pp_gap'] / n:.2f}, PP Approx Ratio: {epoch_pp_metrics['pp_approx_ratio'] / n:.4f}")
                 print(f"    PP Feasibility: {epoch_pp_metrics['pp_feasibility'] / n:.4f}")
 
-            # Build log dict - always log raw metrics
             log_dict = {
                 "train_epoch/loss_total": epoch_metrics["loss_total"] / n,
-                "train_epoch/loss_bce": epoch_metrics["loss_bce"] / n,
                 "train_epoch/loss_feasibility": epoch_metrics["loss_feasibility"] / n,
+                "train_epoch/loss_selection": epoch_metrics["loss_selection"] / n,
                 "epoch": epoch,
-                # Raw metrics
-                "train_epoch/opt_size": epoch_metrics["opt_size"] / n,
                 "train_epoch/pred_size": epoch_metrics["pred_size"] / n,
+                "train_epoch/feasibility": epoch_metrics["feasibility"] / n,
+                "train_epoch/opt_size": epoch_metrics["opt_size"] / n,
                 "train_epoch/gap": epoch_metrics["gap"] / n,
                 "train_epoch/approx_ratio": epoch_metrics["approx_ratio"] / n,
-                "train_epoch/feasibility": epoch_metrics["feasibility"] / n,
             }
 
-            # Add pp metrics when using post-processing
             if cfg.use_postprocessing:
                 log_dict.update(
                     {
                         "train_epoch/pp_pred_size": epoch_pp_metrics["pp_pred_size"] / n,
+                        "train_epoch/pp_feasibility": epoch_pp_metrics["pp_feasibility"] / n,
                         "train_epoch/pp_gap": epoch_pp_metrics["pp_gap"] / n,
                         "train_epoch/pp_approx_ratio": epoch_pp_metrics["pp_approx_ratio"] / n,
-                        "train_epoch/pp_feasibility": epoch_pp_metrics["pp_feasibility"] / n,
                     }
                 )
 
@@ -449,26 +469,24 @@ def main():
         if cfg.validate_every_epoch and rank == 0:
 
             def run_validation(eval_model, prefix="val", model_name="Model"):
-                """Run validation and return metrics dict"""
+                """Run validation and return metrics dict (self-supervised)"""
                 eval_model.eval()
 
-                # Raw metrics (always computed)
                 val_metrics = {
                     "loss_total": 0,
-                    "loss_bce": 0,
                     "loss_feasibility": 0,
-                    "opt_size": 0,
+                    "loss_selection": 0,
                     "pred_size": 0,
+                    "feasibility": 0,
+                    "opt_size": 0,
                     "gap": 0,
                     "approx_ratio": 0,
-                    "feasibility": 0,
                 }
-                # PP metrics (only when use_postprocessing=True)
                 val_pp_metrics = {
                     "pp_pred_size": 0,
+                    "pp_feasibility": 0,
                     "pp_gap": 0,
                     "pp_approx_ratio": 0,
-                    "pp_feasibility": 0,
                 }
                 val_count = 0
 
@@ -482,12 +500,10 @@ def main():
 
                         carry = eval_model.initial_carry(batch)
 
-                        # Run fixed number of supervision steps (no early stopping in validation)
                         for _ in range(cfg.n_supervision):
                             carry, step_loss, metrics, preds, _ = eval_model(carry, batch)
 
-                        # Raw metrics (always)
-                        raw_metrics = compute_metrics(
+                        raw_metrics = compute_metrics_ssl(
                             preds["preds"].squeeze(),
                             batch["edge_index"],
                             batch["y"].float(),
@@ -495,9 +511,8 @@ def main():
                             ptr=batch["ptr"],
                         )
 
-                        # PP metrics (only when use_postprocessing=True)
                         if cfg.use_postprocessing:
-                            pp_metrics = compute_pp_metrics(
+                            pp_metrics = compute_pp_metrics_ssl(
                                 preds["preds"].squeeze(),
                                 batch["edge_index"],
                                 batch["y"].float(),
@@ -505,22 +520,20 @@ def main():
                                 ptr=batch["ptr"],
                             )
 
-                        # Accumulate raw metrics
                         val_metrics["loss_total"] += metrics["loss_total"].item()
-                        val_metrics["loss_bce"] += metrics["loss_bce"].item()
                         val_metrics["loss_feasibility"] += metrics["loss_feasibility"].item()
-                        val_metrics["opt_size"] += raw_metrics["opt_size"]
+                        val_metrics["loss_selection"] += metrics["loss_selection"].item()
                         val_metrics["pred_size"] += raw_metrics["pred_size"]
+                        val_metrics["feasibility"] += raw_metrics["feasibility"]
+                        val_metrics["opt_size"] += raw_metrics["opt_size"]
                         val_metrics["gap"] += raw_metrics["gap"]
                         val_metrics["approx_ratio"] += raw_metrics["approx_ratio"]
-                        val_metrics["feasibility"] += raw_metrics["feasibility"]
 
-                        # Accumulate pp metrics
                         if cfg.use_postprocessing:
                             val_pp_metrics["pp_pred_size"] += pp_metrics["pp_pred_size"]
+                            val_pp_metrics["pp_feasibility"] += pp_metrics["pp_feasibility"]
                             val_pp_metrics["pp_gap"] += pp_metrics["pp_gap"]
                             val_pp_metrics["pp_approx_ratio"] += pp_metrics["pp_approx_ratio"]
-                            val_pp_metrics["pp_feasibility"] += pp_metrics["pp_feasibility"]
 
                         val_count += 1
 
@@ -528,14 +541,14 @@ def main():
                 return val_metrics, val_pp_metrics, n
 
             print(f"\n{'=' * 70}")
-            print(f"Epoch {epoch + 1}/{cfg.epochs} - Validation")
+            print(f"Epoch {epoch + 1}/{cfg.epochs} - Validation (Self-Supervised)")
             print(f"{'=' * 70}")
 
-            # --- Regular Model Validation ---
+            # Regular Model Validation
             val_metrics, val_pp_metrics, n = run_validation(raw_model, prefix="val", model_name="Regular")
 
             print(f"\n📊 Validation (Regular Model) Epoch {epoch + 1}:")
-            print(f"Loss: {val_metrics['loss_total'] / n:.4f} (BCE: {val_metrics['loss_bce'] / n:.4f}, Feas: {val_metrics['loss_feasibility'] / n:.4f})")
+            print(f"Loss: {val_metrics['loss_total'] / n:.4f} (Feas: {val_metrics['loss_feasibility'] / n:.4f}, Sel: {val_metrics['loss_selection'] / n:.4f})")
             print("  Raw Metrics:")
             print(f"    Pred Size: {val_metrics['pred_size'] / n:.1f} / Opt Size: {val_metrics['opt_size'] / n:.1f}")
             print(f"    Gap: {val_metrics['gap'] / n:.2f}, Approx Ratio: {val_metrics['approx_ratio'] / n:.4f}")
@@ -543,39 +556,36 @@ def main():
 
             if cfg.use_postprocessing:
                 print("  PP Metrics (greedy-decoded):")
+                print(f"    PP Pred Size: {val_pp_metrics['pp_pred_size'] / n:.1f}")
                 print(f"    PP Gap: {val_pp_metrics['pp_gap'] / n:.2f}, PP Approx Ratio: {val_pp_metrics['pp_approx_ratio'] / n:.4f}")
                 print(f"    PP Feasibility: {val_pp_metrics['pp_feasibility'] / n:.4f}")
 
-            # Build log dict - always log raw metrics
             val_log_dict = {
                 "val/loss_total": val_metrics["loss_total"] / n,
-                "val/loss_bce": val_metrics["loss_bce"] / n,
                 "val/loss_feasibility": val_metrics["loss_feasibility"] / n,
+                "val/loss_selection": val_metrics["loss_selection"] / n,
                 "epoch": epoch,
-                # Raw metrics
-                "val/opt_size": val_metrics["opt_size"] / n,
                 "val/pred_size": val_metrics["pred_size"] / n,
+                "val/feasibility": val_metrics["feasibility"] / n,
+                "val/opt_size": val_metrics["opt_size"] / n,
                 "val/gap": val_metrics["gap"] / n,
                 "val/approx_ratio": val_metrics["approx_ratio"] / n,
-                "val/feasibility": val_metrics["feasibility"] / n,
             }
 
-            # Add pp metrics when using post-processing
             if cfg.use_postprocessing:
                 val_log_dict.update(
                     {
                         "val/pp_pred_size": val_pp_metrics["pp_pred_size"] / n,
+                        "val/pp_feasibility": val_pp_metrics["pp_feasibility"] / n,
                         "val/pp_gap": val_pp_metrics["pp_gap"] / n,
                         "val/pp_approx_ratio": val_pp_metrics["pp_approx_ratio"] / n,
-                        "val/pp_feasibility": val_pp_metrics["pp_feasibility"] / n,
                     }
                 )
 
             wandb.log(val_log_dict)
 
-            # --- EMA Model Validation ---
+            # EMA Model Validation
             if ema_helper is not None:
-                # Create a copy of model with EMA weights
                 ema_model = ema_helper.ema_copy(raw_model)
                 ema_model.cuda()
 
@@ -583,7 +593,7 @@ def main():
 
                 print(f"\n📊 Validation (EMA Model) Epoch {epoch + 1}:")
                 print(
-                    f"Loss: {ema_val_metrics['loss_total'] / ema_n:.4f} (BCE: {ema_val_metrics['loss_bce'] / ema_n:.4f}, Feas: {ema_val_metrics['loss_feasibility'] / ema_n:.4f})"
+                    f"Loss: {ema_val_metrics['loss_total'] / ema_n:.4f} (Feas: {ema_val_metrics['loss_feasibility'] / ema_n:.4f}, Sel: {ema_val_metrics['loss_selection'] / ema_n:.4f})"
                 )
                 print("  Raw Metrics:")
                 print(f"    Pred Size: {ema_val_metrics['pred_size'] / ema_n:.1f} / Opt Size: {ema_val_metrics['opt_size'] / ema_n:.1f}")
@@ -592,45 +602,42 @@ def main():
 
                 if cfg.use_postprocessing:
                     print("  PP Metrics (greedy-decoded):")
+                    print(f"    PP Pred Size: {ema_val_pp_metrics['pp_pred_size'] / ema_n:.1f}")
                     print(f"    PP Gap: {ema_val_pp_metrics['pp_gap'] / ema_n:.2f}, PP Approx Ratio: {ema_val_pp_metrics['pp_approx_ratio'] / ema_n:.4f}")
                     print(f"    PP Feasibility: {ema_val_pp_metrics['pp_feasibility'] / ema_n:.4f}")
 
                 ema_log_dict = {
                     "val_ema/loss_total": ema_val_metrics["loss_total"] / ema_n,
-                    "val_ema/loss_bce": ema_val_metrics["loss_bce"] / ema_n,
                     "val_ema/loss_feasibility": ema_val_metrics["loss_feasibility"] / ema_n,
+                    "val_ema/loss_selection": ema_val_metrics["loss_selection"] / ema_n,
                     "epoch": epoch,
-                    # Raw metrics
-                    "val_ema/opt_size": ema_val_metrics["opt_size"] / ema_n,
                     "val_ema/pred_size": ema_val_metrics["pred_size"] / ema_n,
+                    "val_ema/feasibility": ema_val_metrics["feasibility"] / ema_n,
+                    "val_ema/opt_size": ema_val_metrics["opt_size"] / ema_n,
                     "val_ema/gap": ema_val_metrics["gap"] / ema_n,
                     "val_ema/approx_ratio": ema_val_metrics["approx_ratio"] / ema_n,
-                    "val_ema/feasibility": ema_val_metrics["feasibility"] / ema_n,
                 }
 
                 if cfg.use_postprocessing:
                     ema_log_dict.update(
                         {
                             "val_ema/pp_pred_size": ema_val_pp_metrics["pp_pred_size"] / ema_n,
+                            "val_ema/pp_feasibility": ema_val_pp_metrics["pp_feasibility"] / ema_n,
                             "val_ema/pp_gap": ema_val_pp_metrics["pp_gap"] / ema_n,
                             "val_ema/pp_approx_ratio": ema_val_pp_metrics["pp_approx_ratio"] / ema_n,
-                            "val_ema/pp_feasibility": ema_val_pp_metrics["pp_feasibility"] / ema_n,
                         }
                     )
 
                 wandb.log(ema_log_dict)
-
-                # Free EMA model copy
                 del ema_model
 
-            model.train()  # Set back to training mode
+            model.train()
 
-        # Save checkpoint every 50 epochs (and always save the last one)
+        # Save checkpoint every 50 epochs
         if rank == 0 and (epoch % 50 == 0 or epoch == cfg.epochs - 1):
             torch.save(raw_model.state_dict(), f"{cfg.checkpoint_path}/epoch_{epoch}.pt")
             print(f"  💾 Checkpoint saved: epoch_{epoch}.pt")
 
-            # Save EMA model separately
             if ema_helper is not None:
                 torch.save(
                     ema_helper.state_dict(),
@@ -640,7 +647,7 @@ def main():
 
     if rank == 0:
         print("\n" + "=" * 70)
-        print("Training Complete!")
+        print("Self-Supervised Training Complete!")
         print("=" * 70)
         wandb.finish()
 
