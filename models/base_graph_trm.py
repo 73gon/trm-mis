@@ -56,14 +56,20 @@ class BaseGraphTRM(nn.Module):
         # FEATURE EMBEDDINGS
         # =====================================================================
 
-        # Node feature embedding (base features like [1, degree_norm])
-        self.x_embed = nn.Linear(input_dim, hidden_dim - pe_dim)
-        self.x_norm = nn.LayerNorm(hidden_dim - pe_dim)
+        if pe_dim > 0:
+            # Node feature embedding + separate PE embedding
+            self.x_embed = nn.Linear(input_dim, hidden_dim - pe_dim)
+            self.x_norm = nn.LayerNorm(hidden_dim - pe_dim)
 
-        # Positional encoding embedding
-        pe_input_dim = config.get("pe_input_dim", 16)
-        self.pe_embed = nn.Linear(pe_input_dim, pe_dim)
-        self.pe_norm = nn.LayerNorm(pe_dim)
+            pe_input_dim = config.get("pe_input_dim", 16)
+            self.pe_embed = nn.Linear(pe_input_dim, pe_dim)
+            self.pe_norm = nn.LayerNorm(pe_dim)
+        else:
+            # No PE: embed features directly to full hidden_dim
+            self.x_embed = nn.Linear(input_dim, hidden_dim)
+            self.x_norm = nn.LayerNorm(hidden_dim)
+            self.pe_embed = None
+            self.pe_norm = None
 
         # =====================================================================
         # GPS LAYERS (Local MPNN + Global Attention)
@@ -167,11 +173,16 @@ class BaseGraphTRM(nn.Module):
         Returns concatenation of:
         - Embedded node features (hidden_dim - pe_dim)
         - Embedded positional encoding (pe_dim)
+        When pe_dim=0, returns embedded features at full hidden_dim.
         """
         x = batch["x"]
 
         # Embed base features
         x_emb = self.x_norm(F.gelu(self.x_embed(x)))
+
+        if self.pe_dim == 0:
+            # No PE mode: x_emb is already hidden_dim
+            return x_emb
 
         # Embed positional encoding if available
         if "pe" in batch and batch["pe"] is not None:

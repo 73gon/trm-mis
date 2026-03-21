@@ -55,6 +55,10 @@ def compute_metrics(probs, edge_index, labels, batch_vec=None, ptr=None):
     total_approx_ratio = 0
     total_violations = 0
     total_edges = 0
+    total_tp = 0
+    total_tn = 0
+    total_fp = 0
+    total_fn = 0
 
     for g in range(num_graphs):
         # Extract subgraph data
@@ -102,6 +106,12 @@ def compute_metrics(probs, edge_index, labels, batch_vec=None, ptr=None):
             total_gap_ratio += graph_gap_ratio
             total_approx_ratio += graph_approx_ratio
 
+        # Confusion matrix for this graph
+        total_tp += (graph_preds_binary * graph_labels).sum().item()
+        total_tn += ((1 - graph_preds_binary) * (1 - graph_labels)).sum().item()
+        total_fp += (graph_preds_binary * (1 - graph_labels)).sum().item()
+        total_fn += ((1 - graph_preds_binary) * graph_labels).sum().item()
+
     # Average over graphs
     avg_opt = total_opt / max(num_graphs, 1)
     avg_pred = total_pred / max(num_graphs, 1)
@@ -120,6 +130,13 @@ def compute_metrics(probs, edge_index, labels, batch_vec=None, ptr=None):
         "gap": avg_gap,
         "approx_ratio": avg_approx_ratio,
         "feasibility": feasibility,
+        "tp": total_tp / max(num_graphs, 1),
+        "tn": total_tn / max(num_graphs, 1),
+        "fp": total_fp / max(num_graphs, 1),
+        "fn": total_fn / max(num_graphs, 1),
+        "precision": total_tp / max(total_tp + total_fp, 1e-8),
+        "recall": total_tp / max(total_tp + total_fn, 1e-8),
+        "f1": (2 * total_tp) / max(2 * total_tp + total_fp + total_fn, 1e-8),
     }
 
 

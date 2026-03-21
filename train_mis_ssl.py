@@ -41,8 +41,6 @@ class LossConfig(BaseModel):
     """Self-supervised loss configuration"""
 
     # Exponential penalty parameter (mu)
-    # Higher = stricter constraint enforcement, but harder to optimize
-    # Lower = softer constraints, easier optimization but may have more violations
     mu: float = 5.0
 
     # Weight for feasibility loss (exponential penalty term)
@@ -50,6 +48,41 @@ class LossConfig(BaseModel):
 
     # Weight for selection loss (maximize set size term)
     selection_weight: float = 5.0
+
+    # Feasibility loss type: "exponential" (default), "log_barrier", "hinge"
+    feasibility_loss_type: str = "exponential"
+
+    # Loss mode: "default", "pi_gnn", "reinforce"
+    loss_mode: str = "default"
+
+    # Exploration noise scale (0 = disabled)
+    noise_scale: float = 0.0
+
+    # Degree-weighted selection loss
+    degree_weighted: bool = False
+
+    # REINFORCE: number of samples per graph
+    reinforce_samples: int = 8
+
+    # Entropy regularization weight (0 = disabled)
+    # Pushes predictions away from uniform toward 0 or 1
+    entropy_weight: float = 0.0
+
+    # Temperature for sigmoid (>1 = softer, <1 = sharper)
+    temperature: float = 1.0
+
+    # Temperature annealing (linear from temp_start to temp_end over training)
+    temp_start: float = 1.0
+    temp_end: float = 1.0
+
+    # Loss weight scheduling: linearly interpolate fw/sw over training
+    # When enabled, fw goes from fw_start to feasibility_weight, sw goes from sw_start to selection_weight
+    use_loss_schedule: bool = False
+    fw_start: float = 0.5  # Initial feasibility weight
+    sw_start: float = 10.0  # Initial selection weight
+
+    # Deep supervision: compute loss at each H-cycle output
+    use_deep_supervision: bool = False
 
 
 class ArchConfig(BaseModel):
@@ -67,9 +100,9 @@ class ArchConfig(BaseModel):
 
 class Config(BaseModel):
     # Data
-    data_paths: List[str] = ["data/mis-10k"]
+    data_paths: List[str] = ["data/difusco_benchmark/datasets/satlib/train"]
     val_split: float = 0.1
-    global_batch_size: int = 256
+    global_batch_size: int = 32
 
     # Training
     lr: float = 1e-4
@@ -98,12 +131,19 @@ class Config(BaseModel):
 
     # Logging
     project_name: str = "MIS-TRM"
-    run_name: str = "mis_trm_ssl_s5_f1_log"
+    run_name: str = "mis_trm_ssl_s5_f1_log_satlib"
     checkpoint_path: str = "checkpoints/mis_ssl"
     log_every: int = 1
 
     # Validation
     validate_every_epoch: bool = True
+
+    # Feature flags (Phase 0: CPU bottleneck elimination)
+    use_pe: bool = True  # Compute Laplacian PE (CPU-heavy)
+    use_enhanced_features: bool = True  # Compute enhanced features (CPU-heavy)
+
+    # Dataset
+    max_shards: int = None  # Limit shards for debugging (None = all)
 
 
 def cosine_schedule_with_warmup(
@@ -131,11 +171,12 @@ def init_distributed():
     return 0, 1
 
 
-def main():
+def main(cfg=None):
     # 1. Setup
     rank, world_size = init_distributed()
 
-    cfg = Config()
+    if cfg is None:
+        cfg = Config()
 
     if rank == 0:
         print("=" * 70)
@@ -145,6 +186,7 @@ def main():
         print(f"Config: LR={cfg.lr}, WD={cfg.weight_decay}, Betas=({cfg.beta1}, {cfg.beta2}), GradClip={cfg.grad_clip}")
         print(f"Arch: Dim={cfg.arch.hidden_dim}, Layers={cfg.arch.num_layers}, H={cfg.arch.H_cycles}, L={cfg.arch.L_cycles}")
         print(f"Loss (SSL): mu={cfg.loss.mu}, feasibility_w={cfg.loss.feasibility_weight}, selection_w={cfg.loss.selection_weight}")
+        print(f"Loss mode: {cfg.loss.loss_mode}, noise_scale={cfg.loss.noise_scale}, degree_weighted={cfg.loss.degree_weighted}")
         print(f"Validation: {cfg.val_split * 100:.0f}% of data")
         pp_mode = "ON (greedy decode)" if cfg.use_postprocessing else "OFF (raw predictions)"
         print(f"Postprocessing: {pp_mode}")
@@ -163,6 +205,9 @@ def main():
         drop_last=True,
         val_split=cfg.val_split,
         seed=cfg.seed,
+        use_pe=cfg.use_pe,
+        use_enhanced_features=cfg.use_enhanced_features,
+        max_shards=cfg.max_shards,
     )
     train_dataset = MISDataset(train_ds_config, split="train")
 
@@ -174,6 +219,9 @@ def main():
         drop_last=False,
         val_split=cfg.val_split,
         seed=cfg.seed,
+        use_pe=cfg.use_pe,
+        use_enhanced_features=cfg.use_enhanced_features,
+        max_shards=cfg.max_shards,
     )
     val_dataset = MISDataset(val_ds_config, split="val")
 
@@ -186,8 +234,16 @@ def main():
     model_config_dict["mu"] = cfg.loss.mu
     model_config_dict["feasibility_weight"] = cfg.loss.feasibility_weight
     model_config_dict["selection_weight"] = cfg.loss.selection_weight
+    model_config_dict["feasibility_loss_type"] = cfg.loss.feasibility_loss_type
     model_config_dict["dropout"] = cfg.arch.dropout
     model_config_dict["attn_dropout"] = cfg.arch.attn_dropout
+    model_config_dict["use_deep_supervision"] = cfg.loss.use_deep_supervision
+    model_config_dict["temperature"] = cfg.loss.temperature
+    model_config_dict["entropy_weight"] = cfg.loss.entropy_weight
+    model_config_dict["loss_mode"] = cfg.loss.loss_mode
+    model_config_dict["noise_scale"] = cfg.loss.noise_scale
+    model_config_dict["degree_weighted"] = cfg.loss.degree_weighted
+    model_config_dict["reinforce_samples"] = cfg.loss.reinforce_samples
 
     if rank == 0:
         print("\n📊 Dataset Summary:")
@@ -256,6 +312,8 @@ def main():
 
     # 5. Training Loop
     step = 0
+    best_val_pp_approx = 0.0
+    best_ema_pp_approx = 0.0
 
     for epoch in range(cfg.epochs):
         # =====================================================================
@@ -306,6 +364,17 @@ def main():
 
             # Move batch to GPU (labels present but not used)
             batch = {k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+
+            # Loss weight scheduling: linearly interpolate fw/sw over training
+            if cfg.loss.use_loss_schedule:
+                progress = step / max(total_steps, 1)
+                raw_model.feasibility_weight = cfg.loss.fw_start + (cfg.loss.feasibility_weight - cfg.loss.fw_start) * progress
+                raw_model.selection_weight = cfg.loss.sw_start + (cfg.loss.selection_weight - cfg.loss.sw_start) * progress
+
+            # Temperature annealing: linearly interpolate over training
+            if cfg.loss.temp_start != cfg.loss.temp_end:
+                progress = step / max(total_steps, 1)
+                raw_model.temperature = cfg.loss.temp_start + (cfg.loss.temp_end - cfg.loss.temp_start) * progress
 
             # Initialize Carry
             carry = raw_model.initial_carry(batch)
@@ -403,6 +472,14 @@ def main():
                         "train/opt_size": raw_metrics["opt_size"],
                         "train/gap": raw_metrics["gap"],
                         "train/approx_ratio": raw_metrics["approx_ratio"],
+                        # Confusion matrix (before decoding)
+                        "train/precision": raw_metrics["precision"],
+                        "train/recall": raw_metrics["recall"],
+                        "train/f1": raw_metrics["f1"],
+                        "train/tp": raw_metrics["tp"],
+                        "train/fp": raw_metrics["fp"],
+                        "train/fn": raw_metrics["fn"],
+                        "train/tn": raw_metrics["tn"],
                         # Training info
                         "epoch": epoch,
                         "lr": current_lr,
@@ -584,6 +661,14 @@ def main():
 
             wandb.log(val_log_dict)
 
+            # Best-epoch checkpointing for regular model
+            if cfg.use_postprocessing:
+                current_pp_approx = val_pp_metrics["pp_approx_ratio"] / n
+                if current_pp_approx > best_val_pp_approx:
+                    best_val_pp_approx = current_pp_approx
+                    torch.save(raw_model.state_dict(), f"{cfg.checkpoint_path}/best.pt")
+                    print(f"  🏆 New best model! PP Approx: {best_val_pp_approx:.4f} (epoch {epoch + 1})")
+
             # EMA Model Validation
             if ema_helper is not None:
                 ema_model = ema_helper.ema_copy(raw_model)
@@ -629,6 +714,15 @@ def main():
                     )
 
                 wandb.log(ema_log_dict)
+
+                # Best-epoch checkpointing for EMA model
+                if cfg.use_postprocessing:
+                    ema_pp_approx = ema_val_pp_metrics["pp_approx_ratio"] / ema_n
+                    if ema_pp_approx > best_ema_pp_approx:
+                        best_ema_pp_approx = ema_pp_approx
+                        torch.save(ema_helper.state_dict(), f"{cfg.checkpoint_path}/best_ema.pt")
+                        print(f"  🏆 New best EMA! PP Approx: {best_ema_pp_approx:.4f} (epoch {epoch + 1})")
+
                 del ema_model
 
             model.train()
@@ -653,4 +747,93 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--feasibility_weight", type=float, default=None)
+    parser.add_argument("--selection_weight", type=float, default=None)
+    parser.add_argument("--mu", type=float, default=None)
+    parser.add_argument("--feasibility_loss_type", type=str, default=None)
+    parser.add_argument("--use_pe", type=int, default=None, help="0 or 1")
+    parser.add_argument("--use_enhanced_features", type=int, default=None, help="0 or 1")
+    parser.add_argument("--run_name", type=str, default=None)
+    parser.add_argument("--max_shards", type=int, default=None)
+    parser.add_argument("--batch_size", type=int, default=None, help="Global batch size")
+    # New Phase B args
+    parser.add_argument("--entropy_weight", type=float, default=None, help="Entropy regularization weight")
+    parser.add_argument("--temperature", type=float, default=None, help="Sigmoid temperature")
+    parser.add_argument("--temp_start", type=float, default=None, help="Temperature annealing start")
+    parser.add_argument("--temp_end", type=float, default=None, help="Temperature annealing end")
+    parser.add_argument("--use_deep_supervision", type=int, default=None, help="0 or 1")
+    parser.add_argument("--use_loss_schedule", type=int, default=None, help="0 or 1")
+    parser.add_argument("--fw_start", type=float, default=None, help="Initial feasibility weight for scheduling")
+    parser.add_argument("--sw_start", type=float, default=None, help="Initial selection weight for scheduling")
+    parser.add_argument("--n_supervision", type=int, default=None, help="Number of forward passes per step")
+    # New Phase C args: loss modes, exploration, infrastructure
+    parser.add_argument("--loss_mode", type=str, default=None, help="Loss mode: default, pi_gnn, reinforce")
+    parser.add_argument("--noise_scale", type=float, default=None, help="Exploration noise scale")
+    parser.add_argument("--degree_weighted", type=int, default=None, help="Degree-weighted selection (0 or 1)")
+    parser.add_argument("--reinforce_samples", type=int, default=None, help="REINFORCE samples per graph")
+    parser.add_argument("--lr", type=float, default=None, help="Learning rate")
+    parser.add_argument("--grad_clip", type=float, default=None, help="Gradient clipping (0 = disabled)")
+    parser.add_argument("--checkpoint_path", type=str, default=None, help="Directory to save checkpoints")
+    args = parser.parse_args()
+
+    cfg = Config()
+    if args.epochs is not None:
+        cfg.epochs = args.epochs
+    if args.run_name is not None:
+        cfg.run_name = args.run_name
+    if args.use_pe is not None:
+        cfg.use_pe = bool(args.use_pe)
+    if args.use_enhanced_features is not None:
+        cfg.use_enhanced_features = bool(args.use_enhanced_features)
+    if args.feasibility_weight is not None:
+        cfg.loss.feasibility_weight = args.feasibility_weight
+    if args.selection_weight is not None:
+        cfg.loss.selection_weight = args.selection_weight
+    if args.mu is not None:
+        cfg.loss.mu = args.mu
+    if args.feasibility_loss_type is not None:
+        cfg.loss.feasibility_loss_type = args.feasibility_loss_type
+    if args.max_shards is not None:
+        cfg.max_shards = args.max_shards
+    if args.batch_size is not None:
+        cfg.global_batch_size = args.batch_size
+    # New Phase B args
+    if args.entropy_weight is not None:
+        cfg.loss.entropy_weight = args.entropy_weight
+    if args.temperature is not None:
+        cfg.loss.temperature = args.temperature
+    if args.temp_start is not None:
+        cfg.loss.temp_start = args.temp_start
+    if args.temp_end is not None:
+        cfg.loss.temp_end = args.temp_end
+    if args.use_deep_supervision is not None:
+        cfg.loss.use_deep_supervision = bool(args.use_deep_supervision)
+    if args.use_loss_schedule is not None:
+        cfg.loss.use_loss_schedule = bool(args.use_loss_schedule)
+    if args.fw_start is not None:
+        cfg.loss.fw_start = args.fw_start
+    if args.sw_start is not None:
+        cfg.loss.sw_start = args.sw_start
+    if args.n_supervision is not None:
+        cfg.n_supervision = args.n_supervision
+    # New Phase C args
+    if args.loss_mode is not None:
+        cfg.loss.loss_mode = args.loss_mode
+    if args.noise_scale is not None:
+        cfg.loss.noise_scale = args.noise_scale
+    if args.degree_weighted is not None:
+        cfg.loss.degree_weighted = bool(args.degree_weighted)
+    if args.reinforce_samples is not None:
+        cfg.loss.reinforce_samples = args.reinforce_samples
+    if args.lr is not None:
+        cfg.lr = args.lr
+    if args.grad_clip is not None:
+        cfg.grad_clip = args.grad_clip
+    if args.checkpoint_path is not None:
+        cfg.checkpoint_path = args.checkpoint_path
+
+    main(cfg)

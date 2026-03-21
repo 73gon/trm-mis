@@ -70,6 +70,10 @@ def compute_metrics_ssl(probs, edge_index, labels, batch_vec=None, ptr=None):
     total_approx_ratio = 0
     total_violations = 0
     total_edges = 0
+    total_tp = 0
+    total_tn = 0
+    total_fp = 0
+    total_fn = 0
 
     for g in range(num_graphs):
         # Extract subgraph data
@@ -108,6 +112,12 @@ def compute_metrics_ssl(probs, edge_index, labels, batch_vec=None, ptr=None):
         total_pred += graph_pred_size
         total_opt += graph_opt_size
 
+        # Confusion matrix for this graph
+        total_tp += (graph_preds_binary * graph_labels).sum().item()
+        total_tn += ((1 - graph_preds_binary) * (1 - graph_labels)).sum().item()
+        total_fp += (graph_preds_binary * (1 - graph_labels)).sum().item()
+        total_fn += ((1 - graph_preds_binary) * graph_labels).sum().item()
+
         if graph_opt_size > 0:
             total_gap += graph_opt_size - graph_pred_size
             total_approx_ratio += graph_pred_size / graph_opt_size
@@ -130,6 +140,13 @@ def compute_metrics_ssl(probs, edge_index, labels, batch_vec=None, ptr=None):
         "opt_size": avg_opt,
         "gap": avg_gap,
         "approx_ratio": avg_approx_ratio,
+        "tp": total_tp / max(num_graphs, 1),
+        "tn": total_tn / max(num_graphs, 1),
+        "fp": total_fp / max(num_graphs, 1),
+        "fn": total_fn / max(num_graphs, 1),
+        "precision": total_tp / max(total_tp + total_fp, 1e-8),
+        "recall": total_tp / max(total_tp + total_fn, 1e-8),
+        "f1": (2 * total_tp) / max(2 * total_tp + total_fp + total_fn, 1e-8),
     }
 
 

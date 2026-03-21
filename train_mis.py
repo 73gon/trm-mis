@@ -1,6 +1,6 @@
 import math
 import os
-from typing import List
+from typing import List, Optional
 
 import torch
 import torch.distributed as dist
@@ -20,15 +20,20 @@ from models.metrics import compute_metrics, compute_pp_metrics
 
 
 class LossConfig(BaseModel):
-    # BCE loss weight for positive class (accounts for class imbalance)
-    # pos_weight = neg_count / pos_count
-    pos_weight: float = 1.0
+    # BCE loss weight for positive class (None = auto from dataset class balance)
+    pos_weight: Optional[float] = None
 
     # Feasibility loss weight: penalizes selecting adjacent nodes
     feasibility_weight: float = 0.0
 
-    # Feasibility loss type: "soft" or "hinge" - hinge gives better accuracy, soft gives guaranteed feasibility
+    # Feasibility loss type: "soft" or "hinge" or "log_barrier"
     feasibility_loss_type: str = "hinge"
+
+    # Selection loss weight (hybrid: adds SSL-style selection loss)
+    selection_weight: float = 0.0
+
+    # Label smoothing (0 = disabled, e.g. 0.1 = use 0.1/0.9 targets)
+    label_smoothing: float = 0.0
 
 
 class ArchConfig(BaseModel):
@@ -46,9 +51,9 @@ class ArchConfig(BaseModel):
 
 class Config(BaseModel):
     # Data
-    data_paths: List[str] = ["data/mis-10k"]
+    data_paths: List[str] = ["data/difusco_benchmark/datasets/satlib/train"]
     val_split: float = 0.1
-    global_batch_size: int = 256
+    global_batch_size: int = 32
 
     # Training
     lr: float = 1e-4
@@ -77,12 +82,22 @@ class Config(BaseModel):
 
     # Logging
     project_name: str = "MIS-TRM"
-    run_name: str = "mis_trm_hinge_w0"
+    run_name: str = "mis_trm_hinge_w0_satlib"
     checkpoint_path: str = "checkpoints/mis"
     log_every: int = 1
 
     # Validation
     validate_every_epoch: bool = True
+
+    # Feature flags (Phase 0: CPU bottleneck elimination)
+    use_pe: bool = True  # Compute Laplacian PE (CPU-heavy)
+    use_enhanced_features: bool = True  # Compute enhanced features (CPU-heavy)
+
+    # Dataset
+    max_shards: int = None  # Limit shards for debugging (None = all)
+
+    # Pretrained weights
+    pretrained: Optional[str] = None  # Path to checkpoint for weight initialization
 
 
 def cosine_schedule_with_warmup(
@@ -110,11 +125,12 @@ def init_distributed():
     return 0, 1
 
 
-def main():
+def main(cfg=None):
     # 1. Setup
     rank, world_size = init_distributed()
 
-    cfg = Config()
+    if cfg is None:
+        cfg = Config()
 
     if rank == 0:
         print("=" * 70)
@@ -141,6 +157,9 @@ def main():
         drop_last=True,
         val_split=cfg.val_split,
         seed=cfg.seed,
+        use_pe=cfg.use_pe,
+        use_enhanced_features=cfg.use_enhanced_features,
+        max_shards=cfg.max_shards,
     )
     train_dataset = MISDataset(train_ds_config, split="train")
 
@@ -152,6 +171,9 @@ def main():
         drop_last=False,
         val_split=cfg.val_split,
         seed=cfg.seed,
+        use_pe=cfg.use_pe,
+        use_enhanced_features=cfg.use_enhanced_features,
+        max_shards=cfg.max_shards,
     )
     val_dataset = MISDataset(val_ds_config, split="val")
 
@@ -175,15 +197,21 @@ def main():
     val_dataloader = DataLoader(val_dataset, batch_size=None, num_workers=0)
 
     # 3. Model configuration - all values from Config classes
-    model_config_dict["pos_weight"] = cfg.loss.pos_weight
+    # Use CLI-specified pos_weight if set, otherwise keep auto-computed from dataset
+    if cfg.loss.pos_weight is not None:
+        model_config_dict["pos_weight"] = cfg.loss.pos_weight
+    # else: keep the auto-computed value from dataset (set at line 180)
     model_config_dict["feasibility_weight"] = cfg.loss.feasibility_weight
     model_config_dict["feasibility_loss_type"] = cfg.loss.feasibility_loss_type
     model_config_dict["dropout"] = cfg.arch.dropout
     model_config_dict["attn_dropout"] = cfg.arch.attn_dropout
+    model_config_dict["selection_weight"] = cfg.loss.selection_weight
+    model_config_dict["label_smoothing"] = cfg.loss.label_smoothing
 
+    effective_pos_weight = model_config_dict["pos_weight"]
     if rank == 0:
         print("\n🚀 Model Configuration:")
-        print(f"  pos_weight: {cfg.loss.pos_weight}")
+        print(f"  pos_weight: {effective_pos_weight} ({'auto from dataset' if cfg.loss.pos_weight is None else 'manual'})")
         print(f"  feasibility_weight: {cfg.loss.feasibility_weight}")
         print(f"  feasibility_loss_type: {cfg.loss.feasibility_loss_type}")
         print(f"  dropout: {cfg.arch.dropout}")
@@ -192,6 +220,18 @@ def main():
 
     model = GraphTransformerTRM(model_config_dict).cuda()
     raw_model = model
+
+    # Load pretrained weights if specified (skip shape-mismatched keys)
+    if cfg.pretrained is not None:
+        state_dict = torch.load(cfg.pretrained, map_location="cuda", weights_only=False)
+        model_state = model.state_dict()
+        filtered = {k: v for k, v in state_dict.items() if k in model_state and v.shape == model_state[k].shape}
+        model.load_state_dict(filtered, strict=False)
+        if rank == 0:
+            skipped = set(state_dict.keys()) - set(filtered.keys())
+            print(f"📦 Loaded {len(filtered)}/{len(state_dict)} pretrained weights from {cfg.pretrained}")
+            if skipped:
+                print(f"  ⚠️  Skipped {len(skipped)} keys (shape mismatch): {skipped}")
 
     # Initialize EMA (Exponential Moving Average) model
     ema_helper = None
@@ -239,6 +279,8 @@ def main():
 
     # 5. Training Loop
     step = 0
+    best_val_pp_approx = 0.0
+    best_ema_pp_approx = 0.0
 
     for epoch in range(cfg.epochs):
         # =====================================================================
@@ -380,6 +422,14 @@ def main():
                         "train/gap": raw_metrics["gap"],
                         "train/approx_ratio": raw_metrics["approx_ratio"],
                         "train/feasibility": raw_metrics["feasibility"],
+                        # Confusion matrix (before decoding)
+                        "train/precision": raw_metrics["precision"],
+                        "train/recall": raw_metrics["recall"],
+                        "train/f1": raw_metrics["f1"],
+                        "train/tp": raw_metrics["tp"],
+                        "train/fp": raw_metrics["fp"],
+                        "train/fn": raw_metrics["fn"],
+                        "train/tn": raw_metrics["tn"],
                         # Training info
                         "epoch": epoch,
                         "lr": current_lr,
@@ -573,6 +623,14 @@ def main():
 
             wandb.log(val_log_dict)
 
+            # Save best regular model checkpoint
+            if cfg.use_postprocessing:
+                current_pp_approx = val_pp_metrics["pp_approx_ratio"] / n
+                if current_pp_approx > best_val_pp_approx:
+                    best_val_pp_approx = current_pp_approx
+                    torch.save(raw_model.state_dict(), f"{cfg.checkpoint_path}/best.pt")
+                    print(f"  🏆 New best model! PP Approx: {best_val_pp_approx:.4f} (epoch {epoch + 1})")
+
             # --- EMA Model Validation ---
             if ema_helper is not None:
                 # Create a copy of model with EMA weights
@@ -620,6 +678,14 @@ def main():
 
                 wandb.log(ema_log_dict)
 
+                # Save best EMA model checkpoint
+                if cfg.use_postprocessing:
+                    current_ema_pp_approx = ema_val_pp_metrics["pp_approx_ratio"] / ema_n
+                    if current_ema_pp_approx > best_ema_pp_approx:
+                        best_ema_pp_approx = current_ema_pp_approx
+                        torch.save(ema_helper.state_dict(), f"{cfg.checkpoint_path}/best_ema.pt")
+                        print(f"  🏆 New best EMA! PP Approx: {best_ema_pp_approx:.4f} (epoch {epoch + 1})")
+
                 # Free EMA model copy
                 del ema_model
 
@@ -646,4 +712,55 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--feasibility_weight", type=float, default=None)
+    parser.add_argument("--feasibility_loss_type", type=str, default=None)
+    parser.add_argument("--use_pe", type=int, default=None, help="0 or 1")
+    parser.add_argument("--use_enhanced_features", type=int, default=None, help="0 or 1")
+    parser.add_argument("--run_name", type=str, default=None)
+    parser.add_argument("--max_shards", type=int, default=None)
+    parser.add_argument("--batch_size", type=int, default=None, help="Global batch size")
+    parser.add_argument("--pos_weight", type=float, default=None, help="Positive class weight for BCE (None=auto from dataset)")
+    # New Phase C args
+    parser.add_argument("--selection_weight", type=float, default=None, help="Hybrid SSL selection loss weight")
+    parser.add_argument("--label_smoothing", type=float, default=None, help="Label smoothing factor")
+    parser.add_argument("--n_supervision", type=int, default=None, help="Number of forward passes per step")
+    parser.add_argument("--pretrained", type=str, default=None, help="Path to pretrained checkpoint for fine-tuning")
+    parser.add_argument("--checkpoint_path", type=str, default=None, help="Directory to save checkpoints")
+    args = parser.parse_args()
+
+    cfg = Config()
+    if args.epochs is not None:
+        cfg.epochs = args.epochs
+    if args.run_name is not None:
+        cfg.run_name = args.run_name
+    if args.use_pe is not None:
+        cfg.use_pe = bool(args.use_pe)
+    if args.use_enhanced_features is not None:
+        cfg.use_enhanced_features = bool(args.use_enhanced_features)
+    if args.feasibility_weight is not None:
+        cfg.loss.feasibility_weight = args.feasibility_weight
+    if args.feasibility_loss_type is not None:
+        cfg.loss.feasibility_loss_type = args.feasibility_loss_type
+    if args.max_shards is not None:
+        cfg.max_shards = args.max_shards
+    if args.batch_size is not None:
+        cfg.global_batch_size = args.batch_size
+    if args.pos_weight is not None:
+        cfg.loss.pos_weight = args.pos_weight
+    # New Phase C args
+    if args.selection_weight is not None:
+        cfg.loss.selection_weight = args.selection_weight
+    if args.label_smoothing is not None:
+        cfg.loss.label_smoothing = args.label_smoothing
+    if args.n_supervision is not None:
+        cfg.n_supervision = args.n_supervision
+    if args.pretrained is not None:
+        cfg.pretrained = args.pretrained
+    if args.checkpoint_path is not None:
+        cfg.checkpoint_path = args.checkpoint_path
+
+    main(cfg)

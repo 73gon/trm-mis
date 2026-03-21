@@ -229,6 +229,8 @@ class MISDatasetConfig:
         max_shards=None,
         inject_noise=False,  # Inject random noise for symmetry breaking
         pe_dim=16,  # Laplacian PE dimension
+        use_pe=True,  # Compute Laplacian PE (CPU-heavy: scipy eigsh)
+        use_enhanced_features=True,  # Compute enhanced features (CPU-heavy: NetworkX)
     ):
         self.dataset_paths = dataset_paths
         self.global_batch_size = global_batch_size
@@ -240,7 +242,9 @@ class MISDatasetConfig:
         self.val_split = val_split  # Fraction of data for validation (0.1 = 10%)
         self.max_shards = max_shards  # Limit shards for debugging/testing
         self.inject_noise = inject_noise
-        self.pe_dim = pe_dim
+        self.pe_dim = pe_dim if use_pe else 0
+        self.use_pe = use_pe
+        self.use_enhanced_features = use_enhanced_features
 
 
 class MISDataset(IterableDataset):
@@ -328,13 +332,15 @@ class MISDataset(IterableDataset):
             for sample in self.all_graphs:
                 sample_copy = sample.copy()
 
-                # Compute Laplacian PE for this graph
-                pe = compute_laplacian_pe(sample["edge_index"], sample["n"], pe_dim=config.pe_dim)
-                sample_copy["pe"] = pe
+                # Compute Laplacian PE for this graph (skip if use_pe=False)
+                if config.use_pe:
+                    pe = compute_laplacian_pe(sample["edge_index"], sample["n"], pe_dim=config.pe_dim)
+                    sample_copy["pe"] = pe
 
-                # Compute enhanced node features (clustering, k-core, neighbor stats)
-                x_enhanced = compute_node_features(sample["edge_index"], sample["n"], sample["x"])
-                sample_copy["x"] = x_enhanced
+                # Compute enhanced node features (skip if use_enhanced_features=False)
+                if config.use_enhanced_features:
+                    x_enhanced = compute_node_features(sample["edge_index"], sample["n"], sample["x"])
+                    sample_copy["x"] = x_enhanced
 
                 # Only inject noise if explicitly enabled
                 if config.inject_noise:
@@ -355,12 +361,13 @@ class MISDataset(IterableDataset):
             print(f"[{split.upper()}] Caching complete. input_dim={self.metadata.input_dim}, pe_dim={self.metadata.pe_dim}")
 
         else:
-            # Standard streaming setup - compute enhanced input_dim
-            # Features: original (2) + enhanced (10) = 12
-            # Original: [1, degree_norm]
-            # Enhanced: [raw_deg_norm, clustering, avg_neigh, max_neigh, min_neigh, core,
-            #            avg_sp_dist, max_sp_dist, min_sp_dist, closeness]
-            self.metadata.input_dim = 12  # 2 original + 10 enhanced features
+            # Standard streaming setup - compute input_dim based on flags
+            if config.use_enhanced_features:
+                # Features: original (2) + enhanced (10) = 12
+                self.metadata.input_dim = 12
+            else:
+                # Raw features only: [1, degree_norm]
+                self.metadata.input_dim = 2
             self.metadata.pe_dim = config.pe_dim
             print(f"[{split.upper()}] Streaming mode. input_dim={self.metadata.input_dim}, pe_dim={self.metadata.pe_dim}")
 
@@ -471,13 +478,15 @@ class MISDataset(IterableDataset):
             # Apply feature enhancement on-the-fly (same as caching path)
             sample_copy = sample.copy()
 
-            # Compute Laplacian PE
-            pe = compute_laplacian_pe(sample["edge_index"], sample["n"], pe_dim=self.config.pe_dim)
-            sample_copy["pe"] = pe
+            # Compute Laplacian PE (skip if use_pe=False)
+            if self.config.use_pe:
+                pe = compute_laplacian_pe(sample["edge_index"], sample["n"], pe_dim=self.config.pe_dim)
+                sample_copy["pe"] = pe
 
-            # Compute enhanced node features
-            x_enhanced = compute_node_features(sample["edge_index"], sample["n"], sample["x"])
-            sample_copy["x"] = x_enhanced
+            # Compute enhanced node features (skip if use_enhanced_features=False)
+            if self.config.use_enhanced_features:
+                x_enhanced = compute_node_features(sample["edge_index"], sample["n"], sample["x"])
+                sample_copy["x"] = x_enhanced
 
             buffer.append(sample_copy)
 

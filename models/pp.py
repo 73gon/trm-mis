@@ -2,18 +2,20 @@ import numpy as np
 import torch
 
 
-def greedy_decode(probs, edge_index, num_nodes):
+def greedy_decode(probs, edge_index, num_nodes, threshold=0.5):
     """
     Turns probabilities into a valid Independent Set using a greedy strategy.
 
-    IMPORTANT: Only considers nodes with prob > 0.5 (model's actual predictions).
-    This ensures pp_pred_size <= pred_size (post-processing refines, not expands).
-
     Algorithm:
-    1. Filter to only nodes with prob > 0.5
+    1. Filter to only nodes with prob > threshold
     2. Sort these nodes by probability (highest first)
     3. Greedily pick nodes, blocking neighbors
-    4. Result is a feasible subset of the model's predictions
+    4. Result is a feasible independent set
+
+    Args:
+        threshold: Minimum probability to consider a node as candidate.
+                   0.5 = only model's positive predictions (conservative).
+                   0.0 = consider all nodes, use probability ranking only (aggressive).
 
     Returns: (set_size, selected_nodes_tensor)
     """
@@ -26,8 +28,8 @@ def greedy_decode(probs, edge_index, num_nodes):
         adj[u].add(v)
         adj[v].add(u)
 
-    # Only consider nodes that the model predicted (prob > 0.5)
-    candidate_nodes = np.where(probs_np > 0.5)[0]
+    # Only consider nodes above threshold
+    candidate_nodes = np.where(probs_np > threshold)[0]
 
     # Sort candidate nodes by probability (descending)
     if len(candidate_nodes) > 0:

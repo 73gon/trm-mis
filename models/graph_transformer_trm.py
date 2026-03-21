@@ -61,6 +61,12 @@ class GraphTransformerTRM(BaseGraphTRM):
         self.feasibility_weight = config.get("feasibility_weight", 1.0)
         self.feasibility_loss_type = config.get("feasibility_loss_type", "soft")
 
+        # Hybrid: add SSL-style selection loss to encourage larger sets
+        self.selection_weight = config.get("selection_weight", 0.0)
+
+        # Label smoothing: use softer targets (e.g., 0.1/0.9 instead of 0/1)
+        self.label_smoothing = config.get("label_smoothing", 0.0)
+
     def check_perfect_prediction(self, y, labels, edge_index):
         """
         Check if current prediction is perfect:
@@ -211,9 +217,14 @@ class GraphTransformerTRM(BaseGraphTRM):
                 pos_weight = torch.tensor([neg_count / pos_count], device=x.device, dtype=x.dtype)
 
         # Weighted BCE for training (accounts for class imbalance)
+        # Apply label smoothing if configured
+        smooth_labels = labels
+        if self.label_smoothing > 0:
+            smooth_labels = labels * (1 - self.label_smoothing) + (1 - labels) * self.label_smoothing
+
         bce_loss = F.binary_cross_entropy_with_logits(
             logits,
-            labels,
+            smooth_labels,
             pos_weight=pos_weight,
         )
 
@@ -221,17 +232,24 @@ class GraphTransformerTRM(BaseGraphTRM):
         probs = torch.sigmoid(logits)
         src, dst = edge_index[0], edge_index[1]
         # Feasibility loss: penalize edges where both endpoints are predicted as selected
-        if self.feasibility_loss_type == "hinge":
+        if self.feasibility_loss_type == "log_barrier":
+            # Log-barrier: -log(1 - p_u * p_v) — direct penalty, no exp wrapping
+            edge_violations = -torch.log(1 - (probs[src] * probs[dst]).clamp(max=1 - 1e-8))
+        elif self.feasibility_loss_type == "hinge":
             # Hinge loss: only penalize when BOTH endpoints > 0.5 (would be selected)
-            # This focuses gradient on actual violations, not all edges
-            # relu(p - 0.5) is 0 if p < 0.5, else (p - 0.5)
             edge_violations = F.relu(probs[src] - 0.5) * F.relu(probs[dst] - 0.5)
         else:
             # Soft loss: penalize all edges proportionally (original behavior)
             edge_violations = probs[src] * probs[dst]
         feasibility_loss = edge_violations.mean() if edge_violations.numel() > 0 else torch.tensor(0.0, device=x.device)
 
-        loss = bce_loss + self.feasibility_weight * feasibility_loss
+        # Selection loss (hybrid): encourages selecting MORE nodes
+        selection_loss = torch.tensor(0.0, device=x.device)
+        if self.selection_weight > 0:
+            log_probs = torch.log(probs.clamp(min=1e-8))
+            selection_loss = -log_probs.mean()
+
+        loss = bce_loss + self.feasibility_weight * feasibility_loss + self.selection_weight * selection_loss
 
         # Compute Q_hat: confidence that prediction is correct
         # Q_hat = 1 if model is confident and correct, 0 otherwise
@@ -264,6 +282,7 @@ class GraphTransformerTRM(BaseGraphTRM):
                 "loss_total": loss.detach(),
                 "loss_bce": bce_loss.detach(),
                 "loss_feasibility": (self.feasibility_weight * feasibility_loss).detach(),
+                "loss_selection": (self.selection_weight * selection_loss).detach(),
                 "acc": acc,
                 "num_pred_1s": num_pred_1s,
                 "num_true_1s": num_true_1s,

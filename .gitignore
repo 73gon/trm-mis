@@ -5,3 +5,5 @@ outputs
 data
 visualizations
 vis
+logs
+*.out
