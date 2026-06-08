@@ -1,171 +1,205 @@
 \documentclass[10pt,a4paper]{article}
 
 % --- Layout: tight margins to fit a dense 3-page report ---
-\usepackage[margin=2.0cm]{geometry}
+\usepackage[margin=1.7cm]{geometry}
 \usepackage{amsmath,amssymb}
 \usepackage{graphicx}
 \usepackage{booktabs}
 \usepackage{array}
-\usepackage{siunitx}
-\usepackage[table]{xcolor}
 \usepackage[hidelinks]{hyperref}
 \usepackage{caption}
 \captionsetup{font=small,labelfont=bf}
 \usepackage{titlesec}
-\titlespacing*{\section}{0pt}{6pt}{3pt}
-\titlespacing*{\subsection}{0pt}{4pt}{2pt}
-\setlength{\parskip}{2pt}
+\titlespacing*{\section}{0pt}{7pt}{3pt}
+\titlespacing*{\subsection}{0pt}{5pt}{2pt}
+\setlength{\parskip}{1.5pt}
 \setlength{\parindent}{0pt}
 
-% figures live in ../../visualizations relative to this file
-\graphicspath{{../../visualizations/}}
+% figures are stored next to this file so the report is self-contained
+\graphicspath{{figs/}}
 
 \newcommand{\ppar}{\mathrm{pp\text{-}AR}}
 
-\title{\vspace{-1.2cm}\textbf{Recurrent Graph Transformers for the\\Maximum Independent Set Problem}}
-\author{}
-\date{\vspace{-1.0cm}}
+\title{\vspace{-1.2cm}\textbf{Recurrent Reasoning Networks for the\\Maximum Independent Set Problem}}
+\author{Malik Mardan}
+\date{June 8, 2026}
 
 \begin{document}
 \maketitle
-\vspace{-0.8cm}
+\vspace{-0.7cm}
+
+\noindent\small This project adapts the Tiny Recursive Model (TRM) of
+Jolicoeur-Martineau et al., \emph{Less is More: Recursive Reasoning with Tiny
+Networks} (arXiv:2510.04871), from grid puzzles to graph problems. The idea of
+TRM is that a very small network, applied many times in a recurrent loop, can
+solve hard reasoning tasks that usually call for much larger models. We test
+whether that holds for the Maximum Independent Set problem.
+Code: \url{https://github.com/73gon/trm-mis}.
+\normalsize
 
 %==========================================================================
 \section{Approach}
 
 \paragraph{Problem.}
-Given an undirected graph $G=(V,E)$, the \emph{Maximum Independent Set} (MIS)
-problem asks for the largest $S\subseteq V$ such that no two nodes in $S$ are
-adjacent. MIS is NP-hard. We treat it as a per-node binary classification task:
-the model predicts $p_v\in[0,1]$, the probability that node $v$ belongs to an
-optimal independent set, and a deterministic decoder turns these scores into a
-feasible set.
+Given an undirected graph $G=(V,E)$, the Maximum Independent Set (MIS) problem
+asks for the largest set $S\subseteq V$ in which no two nodes share an edge. MIS
+is NP-hard. We frame it as per-node classification: the network outputs a
+probability $p_v\in[0,1]$ that node $v$ belongs to an optimal set, and a
+deterministic decoder turns these probabilities into a valid independent set.
 
 \paragraph{Architecture.}
-The model is a \emph{recurrent graph transformer} (\texttt{GraphTransformerTRM},
-$\approx\!1.55$\,M parameters) that couples a GPS message-passing/attention
-backbone with a TRM-style (Tiny Recursive Model) reasoning loop:
+The model (\texttt{GraphTransformerTRM}, about $1.55$\,M parameters) combines a
+graph-transformer backbone with the recurrent reasoning loop of TRM:
 \begin{itemize}\itemsep1pt
-  \item \textbf{Input features.} Node features $x_v=[\,1,\ \deg_v/(n{-}1)\,]$
-    augmented with a $16$-dimensional positional encoding (random-walk / Laplacian
-    PE), giving a $12$-dim embedding after a linear+LayerNorm stem.
-  \item \textbf{GPS layer} (hidden $=256$, $2$ layers, $2$ heads): each layer
-    combines a \emph{local} GIN message-passing branch with a \emph{global}
-    multi-head self-attention branch, so a node aggregates both neighbourhood and
-    long-range information.
+  \item \textbf{Inputs.} Each node carries $12$ local structural features
+    (degree and normalised degree, clustering coefficient, neighbour-degree
+    statistics, and $k$-core number) plus a $16$-dimensional positional encoding.
+    These are embedded and concatenated into a $256$-dimensional vector.
+  \item \textbf{GPS layers} ($2$ layers, hidden width $256$, $4$ attention
+    heads). Every layer runs a local GIN message-passing branch and a global
+    self-attention branch in parallel, so a node sees both its neighbourhood and
+    the whole graph.
   \item \textbf{Recurrent reasoning.} A latent state $z$ and an output state $y$
-    are refined by $H\!=\!2$ outer cycles of $L\!=\!6$ latent updates
-    ($z\!\leftarrow\!\mathrm{GPS}(x,y,z)$, then $y\!\leftarrow\!\mathrm{head}(y,z)$).
-    The first $H{-}1$ cycles run under \texttt{no\_grad} and only the final cycle
-    backpropagates, i.e.\ truncated back-propagation through a $12$-step
-    reasoning trajectory. This lets a small network ``think'' iteratively rather
-    than scale parameters.
+    are refined by $H{=}2$ outer cycles of $L{=}6$ inner updates, giving $12$
+    reasoning steps in total. Only the final step backpropagates; the earlier
+    ones run without gradients. This lets the small network improve its answer
+    by repeating computation instead of adding parameters, which is the central
+    claim of TRM.
 \end{itemize}
 
 \paragraph{Training.}
-Fully supervised. The loss combines a class-weighted binary cross-entropy with a
-soft feasibility penalty,
+The model is trained with full supervision. The loss adds a class-weighted binary
+cross-entropy on the node labels to a soft feasibility penalty that punishes
+giving high probability to both endpoints of an edge:
 \[
-\mathcal{L}=\underbrace{\mathrm{BCE}_{w}(\sigma(z),y)}_{\text{node label}}
-   \;+\;\lambda\,\underbrace{\tfrac{1}{2|E|}\!\!\sum_{(u,v)\in E}\! p_u p_v}_{\text{edge violations}},
-   \qquad \lambda=2 ,
+\mathcal{L}=\mathrm{BCE}_{w}(\sigma(z),y)
+   \;+\;\lambda\,\tfrac{1}{2|E|}\!\!\sum_{(u,v)\in E}\! p_u p_v ,
+   \qquad \lambda=2 .
 \]
-where the feasibility term directly punishes selecting both endpoints of an edge.
-For the small graphs we use \emph{multi-MIS soft labels}: Gurobi enumerates up to
-$16$ strictly-optimal MISs (\texttt{PoolSearchMode=2}, \texttt{PoolGap=0}) and the
-target $y_v$ is the \emph{fraction} of optimal solutions that contain $v$ --- a
-calibrated target whose Bayes-optimal BCE is $>0$ (e.g.\ $0.19$ at $n{=}50$).
-Optimisation: AdamW ($\text{wd}=0.05$), OneCycleLR ($\text{max\_lr}=3\!\times\!10^{-4}$,
-$10\%$ warm-up, cosine anneal), \texttt{bf16} autocast, dropout $0.15$, with early
-stopping on the held-out eval BCE.
+Labels come in two flavours. For the small graphs we compute \emph{multi-solution}
+targets: Gurobi enumerates up to $16$ strictly optimal independent sets per graph,
+and the target $y_v$ is the fraction of those optima that contain node $v$. Such a
+target is calibrated, so its own cross-entropy is strictly positive (about $0.19$
+at $n{=}50$). For the large benchmarks we use a single near-optimal labelling from
+the KaMIS solver together with a positive-class weight $w$ ($w{=}1$ for the small
+runs, $w{=}2$ for SATLIB, $w{=}5$ for the dense ER graphs). Optimisation uses AdamW
+(weight decay $0.05$), a OneCycle learning-rate schedule (peak $3\times10^{-4}$,
+$10\%$ warm-up, cosine decay), \texttt{bf16} precision, and dropout $0.15$, with
+early stopping on the held-out test loss.
 
-\paragraph{Evaluation metric.}
-At eval time the soft scores are decoded by a \emph{greedy} rule (sort by $p_v$,
-add a node if no selected neighbour blocks it), which is \emph{always feasible}.
-The headline number is the post-processed approximation ratio
-\[
-\ppar=\frac{|S_{\text{greedy}}|}{|S^\star|}\in[0,1],\qquad \ppar=1 \Leftrightarrow \text{optimal},
-\]
-reported as a per-graph mean. Because greedy decoding guarantees feasibility,
-post-processed feasibility ($\mathrm{pp\text{-}feas}$) is $1.0$ in every run.
+\paragraph{What the numbers mean.}
+\begin{itemize}\itemsep0.5pt
+  \item \textbf{Iteration.} One gradient update on one mini-batch of graphs; ``$29$k
+    iterations'' means $29{,}000$ updates. We evaluate every $500$ iterations and
+    keep the best checkpoint, so runs stop at different counts.
+  \item \textbf{Approximation ratio ($\ppar$).} The main quality metric. We decode
+    the probabilities greedily (take nodes by probability, skip any neighbour of a
+    chosen node) and report $|S_{\text{ours}}|/|S^\star|$; $1.0$ is optimal.
+  \item \textbf{Feasibility.} The share of decoded solutions that are valid
+    independent sets. Greedy decoding can never pick two adjacent nodes, so it is
+    $1.0$ by construction; the difficulty is reaching the optimum, not staying valid.
+  \item \textbf{BCE.} Cross-entropy between the predicted probability and the
+    training label. It measures calibration against one labelling, which is not the
+    same as the quality of the final set (see below).
+  \item \textbf{Confusion matrix.} Per node, whether predicted MIS membership
+    matches the ground truth, split into true/false positives and negatives.
+\end{itemize}
 
 %==========================================================================
 \section{Experiments}
 
-We study two regimes: (i) a controlled \emph{size-scaling} study on
-Erd\H{o}s--R\'enyi (ER) graphs of fixed average degree $d=7.35$ for
-$n\in\{50,100,200,300\}$ (each with a held-out test split, Gurobi-exact labels),
-and (ii) two large \emph{benchmark} datasets from the DIFUSCO suite:
-\textbf{SATLIB} (SAT$\to$MIS conflict graphs, $\sim\!1400$ nodes) and
-\textbf{ER-700-800} (dense ER graphs, $n\in[700,800]$, $\bar d\approx112$),
-labelled by KaMIS.
+We run two studies. The first is a controlled scaling study on
+Erd\H{o}s--R\'enyi (ER) graphs of fixed average degree $7.35$ at sizes
+$n\in\{50,100,200,300\}$, each with a held-out test split and exact Gurobi labels.
+The second uses two larger benchmarks from the DIFUSCO suite: SATLIB (SAT formulas
+turned into conflict graphs, around $1400$ nodes) and ER-700-800 (dense ER graphs
+of $700$ to $800$ nodes, average degree about $112$), both labelled by KaMIS.
 
-\subsection{Learning curves and scaling}
+\subsection{Scaling over problem size}
 
-Across all four small sizes the model exhibits a textbook descent: eval BCE falls
-from the random-init value $\approx\!0.73$ ($\approx\!\ln 2$) to $0.23$--$0.32$,
-while $\ppar$ rises from $\approx\!0.886$ at initialisation to $\geq 0.98$
-(Fig.~\ref{fig:small}). Larger graphs converge \emph{faster} in iterations
-(n=200/300 peak around iter $11$k--$15$k) but also overfit sooner because their
-training pools are smaller ($12$k vs.\ $50$k graphs); early stopping on eval BCE
-selects the best checkpoint in each case.
+On all four small sizes the model learns cleanly (Fig.~\ref{fig:small}). The test
+BCE drops from its random-init value near $0.73$ to between $0.23$ and $0.32$,
+while $\ppar$ climbs from about $0.886$ at initialisation to at least $0.98$. Larger
+graphs reach their best checkpoint in fewer iterations because each graph carries
+more signal, but they also start to overfit sooner since their training pools are
+smaller (Table~\ref{tab:main}). The model generalises rather than memorises: train
+and test graphs use disjoint random seeds.
 
 \begin{figure}[h]
   \centering
-  \includegraphics[width=0.92\linewidth]{learning_curve_v8_all.png}
-  \caption{Held-out learning curves for $n\in\{50,100,200,300\}$ ER graphs.
-  Left: eval BCE (lower is better). Right: post-processed approximation ratio
-  $\ppar$ (higher is better). Uniform eval cadence every $500$ iterations, plus
-  an iteration-0 random-init baseline.}
+  \includegraphics[width=0.66\linewidth]{small_mis_curves.png}
+  \caption{Held-out learning curves for the four small ER sizes. Left: test BCE
+  (lower is better). Right: approximation ratio $\ppar$ (higher is better).}
   \label{fig:small}
 \end{figure}
 
 \begin{table}[h]
 \centering
 \small
-\caption{Main results. Small ER rows are size-scaling runs (best checkpoint by
-$\ppar$); the bottom block are large-scale benchmarks. $q$ is the mean MIS
-fraction $|S^\star|/n$. Node-level F1/prec/rec are at the same checkpoint.}
+\caption{Main results. The top block is the small-ER scaling study; the bottom
+block is the two large benchmarks. $q$ is the average MIS fraction $|S^\star|/n$.
+``best BCE'' is the lowest test BCE over the run and ``best $\ppar$'' the highest
+test ratio; the two can occur at different checkpoints. Feasibility is $1.00$
+everywhere thanks to greedy decoding.}
 \label{tab:main}
-\begin{tabular}{llcccccccc}
+\begin{tabular}{lrrrrrrr}
 \toprule
-Dataset & $n$ & $q$ & init BCE & best BCE & $\ppar$ & F1 & prec & rec & stop iter \\
+Dataset & nodes & train graphs & $q$ & best BCE & best $\ppar$ & feas. & iter @ best $\ppar$\\
 \midrule
-ER $d{=}7.35$ & 50  & 0.32 & 0.729 & \textbf{0.226} & \textbf{0.982} & 0.847 & 0.848 & 0.847 & 29.5k \\
-ER $d{=}7.35$ & 100 & 0.34 & 0.728 & \textbf{0.268} & \textbf{0.993} & 0.831 & 0.825 & 0.837 & 48.0k \\
-ER $d{=}7.35$ & 200 & 0.36 & 0.726 & \textbf{0.319} & \textbf{0.995} & 0.820 & 0.806 & 0.835 & 17.0k \\
-ER $d{=}7.35$ & 300 & 0.36 & 0.725 & \textbf{0.307} & \textbf{0.997} & 0.830 & 0.819 & 0.840 & 17.5k \\
+ER $d{=}7.35$ & 50  & 50{,}000 & 0.32 & 0.226 & \textbf{0.982} & 1.00 & 29.5k \\
+ER $d{=}7.35$ & 100 & 50{,}000 & 0.34 & 0.268 & \textbf{0.993} & 1.00 & 25.5k \\
+ER $d{=}7.35$ & 200 & 12{,}000 & 0.36 & 0.319 & \textbf{0.995} & 1.00 & 11.5k \\
+ER $d{=}7.35$ & 300 & \phantom{0}3{,}000 & 0.36 & 0.307 & \textbf{0.997} & 1.00 & 15.5k \\
 \midrule
-SATLIB (CBS)     & $\sim$1400 & 0.33 & --- & 0.82 & \textbf{0.998} & 0.644 & 0.555 & 0.769 & 400k \\
-ER-700-800       & 700--800   & 0.06 & --- & ---  & \textbf{0.903} & 0.201 & 0.122 & 0.572 & 325k \\
+SATLIB        & $\sim$1400 & 9{,}000 & 0.33 & 0.713 & \textbf{0.998} & 1.00 & 150k \\
+ER-700-800    & 700--800   & 25{,}000 & 0.06 & n/a   & \textbf{0.903} & 1.00 & 325k \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsection{Confusion matrices (node level)}
+\subsection{Why a high BCE can still give a high approximation ratio}
 
-Table~\ref{tab:cm} reports the node-classification confusion matrix at each best
-checkpoint, derived exactly from the logged precision/recall and the measured MIS
-prevalence $q$ (entries are \% of all nodes; $\mathrm{Acc}=\mathrm{TP}+\mathrm{TN}$).
-The small-ER models are well-balanced (false positives $\approx$ false negatives,
-$\approx\!90\%$ node accuracy). The benchmarks tell a different story: both
-\emph{over-predict} membership (large FP), yet the greedy decoder still recovers
-near-optimal \emph{sets} --- the node-level metric and the MIS objective decouple
-(see Insights).
+A striking pattern in Table~\ref{tab:main} is that SATLIB reaches the best
+approximation ratio of the whole study ($\ppar=0.998$) while its BCE stays around
+$0.7$ to $0.8$, far above the small ER runs that sit near $0.25$. The two metrics
+measure different things. BCE asks whether each node probability matches one fixed
+labelling. The benchmark graphs have many different optimal sets, but KaMIS returns
+only one of them, so a node that belongs to some other optimum is labelled $0$ even
+though the model sensibly gives it a moderate probability. That mismatch, together
+with the positive-class weight, keeps BCE high. The approximation ratio, by
+contrast, depends only on the \emph{order} of the probabilities that the greedy
+decoder reads off: as long as good MIS nodes rank above the nodes that conflict
+with them, the decoded set is near optimal regardless of absolute calibration. The
+small ER runs avoid the mismatch because their multi-solution targets are
+calibrated, so they reach both a low BCE and a high ratio. In short, BCE tracks
+probability calibration against one labelling, $\ppar$ tracks set quality, and only
+$\ppar$ reflects the objective we actually care about.
+
+\subsection{Confusion matrices}
+
+Table~\ref{tab:cm} gives the node-level confusion matrix at each best-$\ppar$
+checkpoint, as a percentage of all nodes. The small ER models are balanced, with
+roughly equal false positives and false negatives and about $90\%$ node accuracy.
+The benchmarks behave differently: both over-predict membership (large false-positive
+share), yet the greedy decoder still recovers near-optimal sets, which is the same
+decoupling discussed above. The dense ER case is the extreme: only $6\%$ of nodes
+are in the MIS, the classifier floods the graph with false positives, and node
+accuracy looks fine ($73\%$) only because most nodes are correctly rejected.
 
 \begin{table}[h]
 \centering
 \small
-\caption{Node-level confusion matrices (\% of all nodes) at the best checkpoint.}
+\caption{Node-level confusion matrices at the best-$\ppar$ checkpoint
+(\% of all nodes). TP/FP/FN/TN sum to $100$; accuracy is $\text{TP}+\text{TN}$.}
 \label{tab:cm}
-\begin{tabular}{lccccc}
+\begin{tabular}{lrrrrr}
 \toprule
-Dataset ($n$) & TP & FP & FN & TN & Acc \\
+Dataset & TP & FP & FN & TN & accuracy \\
 \midrule
-ER $n{=}50$    & 27.4 & 4.9  & 5.0 & 62.7 & \textbf{90.1} \\
-ER $n{=}100$   & 28.6 & 6.1  & 5.6 & 59.8 & \textbf{88.4} \\
-ER $n{=}200$   & 29.9 & 7.2  & 5.9 & 57.0 & \textbf{86.9} \\
-ER $n{=}300$   & 30.6 & 6.8  & 5.8 & 56.8 & \textbf{87.4} \\
+ER $n{=}50$    & 27.4 & 4.9  & 5.0 & 62.7 & 90.1 \\
+ER $n{=}100$   & 28.6 & 6.1  & 5.6 & 59.8 & 88.4 \\
+ER $n{=}200$   & 29.9 & 7.2  & 5.9 & 57.0 & 86.9 \\
+ER $n{=}300$   & 30.6 & 6.8  & 5.8 & 56.8 & 87.4 \\
 \midrule
 SATLIB         & 25.6 & 20.6 & 7.7 & 46.1 & 71.7 \\
 ER-700-800     & 3.4  & 24.7 & 2.6 & 69.3 & 72.7 \\
@@ -173,64 +207,63 @@ ER-700-800     & 3.4  & 24.7 & 2.6 & 69.3 & 72.7 \\
 \end{tabular}
 \end{table}
 
-\subsection{When it stopped working}
+\subsection{Scaling up, and where it stopped working}
 
-\textbf{Statistical limit --- dense graphs.} On ER-700-800 (avg.\ degree
-$\approx\!112$, MIS fraction only $q\!\approx\!0.06$) the node classifier
-collapses: F1 $=0.20$, precision $=0.12$. The model essentially learns a
-\emph{ranking} rather than a calibrated classifier; greedy decoding rescues it to
-$\ppar=0.90$ (vs.\ a degree-heuristic baseline of $\ppar=0.60$), but the BCE
-\emph{rises} during training even as $\ppar$ improves --- a clear sign that the
-per-node objective is mis-aligned with the MIS objective at high density.
+The benchmark runs used a $9000$-graph training pool. On SATLIB this succeeded and
+gave the best result of the study, but the run also shows a clear failure mode of
+prolonged training (Fig.~\ref{fig:satlib}). The approximation ratio peaks near
+$0.998$ around iteration $150$k and then slowly falls back to $0.95$, while the BCE
+climbs from $0.7$ to $1.8$. The model keeps fitting the single KaMIS labelling more
+aggressively, which hurts both calibration and, eventually, the decoded sets. Early
+stopping on the test score is therefore essential at this scale.
 
-\textbf{Hardware/scaling limit --- ER at $N{=}9000$.} Training the dense
-ER-700-800 distribution with a $9000$-graph in-memory pool ran out of GPU memory
-(\texttt{CUDA OutOfMemoryError}, $31.4$\,GB card) inside the GIN message-passing
-\texttt{index\_select}, in two independent attempts. The same $N{=}9000$ budget
-\emph{succeeded} on SATLIB (sparser conflict graphs) and reached the best result
-of the whole study, $\ppar=0.998$. The bottleneck is therefore the
-\emph{edge count} of the batched graph (dense ER has $\sim\!40\times$ more edges
-per node than SATLIB), not the number of graphs.
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.66\linewidth]{satlib_n9000.png}
+  \caption{SATLIB with a $9000$-graph pool. The ratio peaks near iteration $150$k
+  and then degrades as the BCE rises, a clear overfitting signature.}
+  \label{fig:satlib}
+\end{figure}
+
+The same $9000$-graph setup did not even start on the dense ER-700-800
+distribution: both attempts ran out of GPU memory on a $31.4$\,GB card inside the
+GIN message-passing step, before a single evaluation. The cause is the edge count,
+not the number of graphs. A dense ER graph of $750$ nodes has roughly $40$ times as
+many edges per node as a SATLIB conflict graph, so a batch of them produces a far
+larger message-passing tensor. The best completed result on this distribution comes
+from a smaller in-memory pool ($25{,}000$ graphs in smaller batches), which reaches
+$\ppar=0.903$, well above a degree-heuristic baseline of $0.60$ but clearly the
+hardest case we tried.
 
 %==========================================================================
-\section{Key Insights}
+\section{Key insights}
 
 \begin{enumerate}\itemsep2pt
-  \item \textbf{The model genuinely learns at small/medium scale.} Every
-    $n\in\{50,\dots,300\}$ run shows monotone BCE descent \emph{and} monotone
-    $\ppar$ ascent on held-out data, reaching $\ppar\in[0.98,0.997]$ with
-    $\approx\!90\%$ node accuracy --- not memorisation, since train and test use
-    disjoint seed ranges.
-
-  \item \textbf{Node-level loss $\neq$ MIS quality.} The decisive metric is the
-    post-processed approximation ratio, not BCE/F1. On SATLIB the model has only
-    F1$=0.64$ yet $\ppar=0.998$; on dense ER, F1$=0.20$ yet $\ppar=0.90$. A
-    weak but \emph{correctly ordered} score, combined with a feasibility-preserving
-    greedy decoder, is enough to obtain near-optimal sets. Optimising or
-    early-stopping on BCE alone is therefore misleading for this task.
-
-  \item \textbf{Graph density is the real difficulty axis, not graph size.}
-    Larger \emph{sparse} graphs (SATLIB, $\sim\!1400$ nodes) are \emph{easier}
-    than smaller \emph{dense} graphs (ER-700-800). Performance and even trainability
-    (OOM) track edge count, because both attention cost and label sparsity
-    ($q$ from $0.36$ down to $0.06$) scale with density.
-
-  \item \textbf{Feasibility is free, optimality is the target.} The greedy decoder
-    makes $\mathrm{pp\text{-}feas}=1.0$ everywhere, so the feasibility loss mainly
-    shapes the ranking; all remaining effort goes into closing the optimality gap.
-
-  \item \textbf{Recurrent depth substitutes for parameters.} A single $1.55$\,M
-    model, unrolled for $12$ reasoning steps, suffices across two orders of
-    magnitude in graph size --- supporting the TRM premise that iterated
-    computation can replace width/depth for combinatorial reasoning.
+  \item \textbf{The tiny recurrent network does learn MIS.} Every small-ER size
+    reaches $\ppar$ between $0.98$ and $0.997$ on held-out graphs with a single
+    $1.55$\,M model unrolled for $12$ steps, which supports the TRM premise that
+    repeated computation can stand in for scale.
+  \item \textbf{Set quality and node loss are different objectives.} A model can
+    have a poor BCE (SATLIB at $0.7$ to $0.8$, dense ER far worse) and still decode
+    near-optimal sets, because the greedy decoder only needs the right ranking.
+    Choosing or stopping a run on BCE alone would be misleading; the approximation
+    ratio is the metric to watch.
+  \item \textbf{Density is the real difficulty axis, not size.} The largest sparse
+    graphs (SATLIB, around $1400$ nodes) were easier than smaller but much denser
+    ER graphs. Both quality and trainability, including the out-of-memory failure,
+    track edge count and the shrinking MIS fraction $q$ rather than node count.
+  \item \textbf{Feasibility is free, optimality is the work.} Greedy decoding keeps
+    feasibility at $1.00$ everywhere, so the feasibility loss mainly shapes the
+    ranking and all remaining effort goes into closing the gap to the optimum.
+  \item \textbf{Long training can hurt.} On the large single-solution benchmark the
+    approximation ratio peaked and then declined with more training, so a held-out
+    stopping criterion matters as much as the model itself.
 \end{enumerate}
 
 \vspace{2pt}
-\noindent{\footnotesize\sloppy\textit{Reproducibility.} Small-ER runs: SLURM jobs
-3991/3992/4060/4089 (\texttt{slurm/smallmis\_n\{50,100,200,300\}\_v8.slurm}),
-trainer \texttt{experiments/overfit\_sl\_pe.py}, data
-\texttt{dataset/build\_mis\_dataset\_multilabel.py}. Benchmarks: SATLIB job 3025,
-ER-700-800 job 2506. Confusion matrices computed from logged precision/recall and
-measured prevalence $q$; figures from \texttt{visualizations/plot\_curves.py}.\par}
+\noindent{\footnotesize\textit{Reproducibility.} All training, data-generation, and
+plotting code, the dataset specifications, and the configuration files are in the
+repository at \url{https://github.com/73gon/trm-mis}. The figures are regenerated by
+the plotting script from the training logs.\par}
 
 \end{document}
