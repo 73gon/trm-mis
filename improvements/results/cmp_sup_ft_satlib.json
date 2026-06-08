@@ -1,0 +1,64 @@
+{
+  "checkpoint": "checkpoints/cmp_sup_ft/best.pt",
+  "data_path": "data/difusco_benchmark/datasets/satlib/test",
+  "n_samples": 32,
+  "n_graphs": 499,
+  "elapsed_seconds": 684.041389465332,
+  "avg_opt_size": 426.0060120240481,
+  "raw_metrics": {
+    "raw_pred_size": 1278.0240480961925,
+    "raw_approx_ratio": 3.0000144173238565,
+    "raw_feasibility": 0.0,
+    "raw_tp": 426.0060120240481,
+    "raw_tn": 0.0,
+    "raw_fp": 852.0180360721442,
+    "raw_fn": 0.0,
+    "raw_precision": 0.3333317352408165,
+    "raw_recall": 1.0,
+    "raw_f1": 0.49999820107000353
+  },
+  "results": {
+    "baseline_greedy": {
+      "mean": 0.9945644611217406,
+      "std": 0.004729512201307921,
+      "min": 0.9747126436781609,
+      "max": 1.0,
+      "mean_size": 423.70741482965934
+    },
+    "enhanced_greedy": {
+      "mean": 0.9959231555005382,
+      "std": 0.0036155540458214005,
+      "min": 0.9813519813519813,
+      "max": 1.0,
+      "mean_size": 424.2805611222445
+    },
+    "multi_threshold": {
+      "mean": 0.9959231555005382,
+      "std": 0.0036155540458214005,
+      "min": 0.9813519813519813,
+      "max": 1.0,
+      "mean_size": 424.2805611222445
+    },
+    "multisample_greedy": {
+      "mean": 0.9951722838193263,
+      "std": 0.004282724097816628,
+      "min": 0.9776674937965261,
+      "max": 1.0,
+      "mean_size": 423.96593186372746
+    },
+    "multisample_enhanced": {
+      "mean": 0.9964534589912095,
+      "std": 0.003229082434476783,
+      "min": 0.9839080459770115,
+      "max": 1.0,
+      "mean_size": 424.5070140280561
+    },
+    "multisample_multi_threshold": {
+      "mean": 0.9964534589912095,
+      "std": 0.003229082434476783,
+      "min": 0.9839080459770115,
+      "max": 1.0,
+      "mean_size": 424.5070140280561
+    }
+  }
+}

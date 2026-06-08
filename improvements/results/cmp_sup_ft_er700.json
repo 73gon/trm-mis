@@ -1,0 +1,64 @@
+{
+  "checkpoint": "checkpoints/cmp_sup_ft/best.pt",
+  "data_path": "data/difusco_benchmark/datasets/er_700_800/test",
+  "n_samples": 32,
+  "n_graphs": 499,
+  "elapsed_seconds": 895.2661349773407,
+  "avg_opt_size": 45.00801603206413,
+  "raw_metrics": {
+    "raw_pred_size": 748.2124248496993,
+    "raw_approx_ratio": 16.62239825474131,
+    "raw_feasibility": 0.0,
+    "raw_tp": 45.00801603206413,
+    "raw_tn": 0.0,
+    "raw_fp": 703.2044088176352,
+    "raw_fn": 0.0,
+    "raw_precision": 0.06022647481852495,
+    "raw_recall": 1.0,
+    "raw_f1": 0.11360384920961687
+  },
+  "results": {
+    "baseline_greedy": {
+      "mean": 0.597140828357725,
+      "std": 0.03813620671153927,
+      "min": 0.5,
+      "max": 0.7045454545454546,
+      "mean_size": 26.871743486973948
+    },
+    "enhanced_greedy": {
+      "mean": 0.7234560711984828,
+      "std": 0.04155572531828496,
+      "min": 0.6,
+      "max": 0.8636363636363636,
+      "mean_size": 32.55711422845691
+    },
+    "multi_threshold": {
+      "mean": 0.7234560711984828,
+      "std": 0.04155572531828496,
+      "min": 0.6,
+      "max": 0.8636363636363636,
+      "mean_size": 32.55711422845691
+    },
+    "multisample_greedy": {
+      "mean": 0.713803493185235,
+      "std": 0.023016304820266984,
+      "min": 0.6595744680851063,
+      "max": 0.7777777777777778,
+      "mean_size": 32.122244488977955
+    },
+    "multisample_enhanced": {
+      "mean": 0.8431228762617332,
+      "std": 0.023012299829046328,
+      "min": 0.782608695652174,
+      "max": 0.9111111111111111,
+      "mean_size": 37.94188376753507
+    },
+    "multisample_multi_threshold": {
+      "mean": 0.8438782709408681,
+      "std": 0.022575715544422992,
+      "min": 0.782608695652174,
+      "max": 0.9111111111111111,
+      "mean_size": 37.97595190380761
+    }
+  }
+}

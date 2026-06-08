@@ -78,8 +78,10 @@ class GraphTransformerTRM(BaseGraphTRM):
         probs = torch.sigmoid(y.squeeze(-1))
         preds_binary = (probs > 0.5).float()
 
-        # Check accuracy (all nodes correct)
-        accuracy = (preds_binary == labels).float().mean()
+        # Check accuracy (all nodes correct). Cast labels through >0.5 so this
+        # works for both hard {0,1} labels and soft multi-MIS labels in [0,1].
+        target_binary = (labels > 0.5).float()
+        accuracy = (preds_binary == target_binary).float().mean()
         is_correct = accuracy == 1.0
 
         # Check feasibility (no violations)
@@ -256,7 +258,8 @@ class GraphTransformerTRM(BaseGraphTRM):
         # Used for early stopping in deep supervision
         with torch.no_grad():
             preds_binary = (probs > 0.5).float()
-            correct = (preds_binary == labels).float()
+            target_binary = (labels > 0.5).float()
+            correct = (preds_binary == target_binary).float()
             confidence = torch.abs(probs - 0.5) * 2  # 0-1 scale
             q_hat = (correct * confidence).mean()  # Average confidence on correct predictions
 
@@ -276,7 +279,7 @@ class GraphTransformerTRM(BaseGraphTRM):
                 num_violations = torch.tensor(0.0, device=x.device)
 
             approx_ratio_pred = num_pred_1s / (num_true_1s + 1e-8)
-            acc = (preds_binary == labels).float().mean()
+            acc = (preds_binary == target_binary).float().mean()
 
             metrics = {
                 "loss_total": loss.detach(),

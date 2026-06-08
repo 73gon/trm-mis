@@ -276,11 +276,28 @@ class MISDataset(IterableDataset):
 
         selected_shards = [all_shards[i] for i in sorted(shard_indices)]
 
-        # 3. Load ALL graphs from selected shards for graph-level splitting
+        # 3. Load ALL graphs from selected shards for graph-level splitting.
+        # If a .cache.pt sibling exists AND is newer than the source, use it.
+        # Cache payloads have precomputed 12-dim x and 16-dim pe, so we skip
+        # the expensive Laplacian eigendecomposition and NetworkX shortest
+        # path work that otherwise cripples CPU throughput.
         all_graphs = []
+        self.shards_are_cached = []  # parallel list of bools
         for shard_path in selected_shards:
-            payload = torch.load(shard_path, weights_only=False)
+            cache_path = shard_path.replace(".pt", ".cache.pt")
+            if (
+                os.path.exists(cache_path)
+                and os.path.getmtime(cache_path) >= os.path.getmtime(shard_path)
+            ):
+                payload = torch.load(cache_path, weights_only=False)
+                self.shards_are_cached.append(True)
+            else:
+                payload = torch.load(shard_path, weights_only=False)
+                self.shards_are_cached.append(False)
             all_graphs.extend(payload["data"])
+        self._has_precomputed = all(self.shards_are_cached) and len(self.shards_are_cached) > 0
+        if self._has_precomputed:
+            print(f"[{split.upper()}] Using precomputed features from {len(selected_shards)} *.cache.pt shards")
 
         # 4. Split at GRAPH level (not shard level)
         num_graphs = len(all_graphs)
@@ -332,13 +349,15 @@ class MISDataset(IterableDataset):
             for sample in self.all_graphs:
                 sample_copy = sample.copy()
 
-                # Compute Laplacian PE for this graph (skip if use_pe=False)
-                if config.use_pe:
+                # Compute Laplacian PE for this graph (skip if use_pe=False
+                # or features already precomputed in *.cache.pt shard)
+                if config.use_pe and not self._has_precomputed:
                     pe = compute_laplacian_pe(sample["edge_index"], sample["n"], pe_dim=config.pe_dim)
                     sample_copy["pe"] = pe
 
-                # Compute enhanced node features (skip if use_enhanced_features=False)
-                if config.use_enhanced_features:
+                # Compute enhanced node features (skip if use_enhanced_features=False
+                # or features already precomputed in *.cache.pt shard)
+                if config.use_enhanced_features and not self._has_precomputed:
                     x_enhanced = compute_node_features(sample["edge_index"], sample["n"], sample["x"])
                     sample_copy["x"] = x_enhanced
 
@@ -362,7 +381,10 @@ class MISDataset(IterableDataset):
 
         else:
             # Standard streaming setup - compute input_dim based on flags
-            if config.use_enhanced_features:
+            if self._has_precomputed:
+                # Cached shards always carry 12-dim x and 16-dim pe
+                self.metadata.input_dim = 12
+            elif config.use_enhanced_features:
                 # Features: original (2) + enhanced (10) = 12
                 self.metadata.input_dim = 12
             else:
@@ -475,16 +497,18 @@ class MISDataset(IterableDataset):
         for idx in indices:
             sample = my_graphs[idx]
 
-            # Apply feature enhancement on-the-fly (same as caching path)
+            # Apply feature enhancement on-the-fly (same as caching path).
+            # Skipped when features are precomputed in *.cache.pt shards.
             sample_copy = sample.copy()
 
-            # Compute Laplacian PE (skip if use_pe=False)
-            if self.config.use_pe:
+            # Compute Laplacian PE (skip if use_pe=False or precomputed)
+            if self.config.use_pe and not self._has_precomputed:
                 pe = compute_laplacian_pe(sample["edge_index"], sample["n"], pe_dim=self.config.pe_dim)
                 sample_copy["pe"] = pe
 
-            # Compute enhanced node features (skip if use_enhanced_features=False)
-            if self.config.use_enhanced_features:
+            # Compute enhanced node features (skip if use_enhanced_features=False
+            # or precomputed)
+            if self.config.use_enhanced_features and not self._has_precomputed:
                 x_enhanced = compute_node_features(sample["edge_index"], sample["n"], sample["x"])
                 sample_copy["x"] = x_enhanced
 

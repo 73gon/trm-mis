@@ -19,8 +19,8 @@ def greedy_decode(probs, edge_index, num_nodes, threshold=0.5):
 
     Returns: (set_size, selected_nodes_tensor)
     """
-    probs_np = probs.cpu().numpy()
-    edge_index_np = edge_index.cpu().numpy()
+    probs_np = probs.detach().float().cpu().numpy()
+    edge_index_np = edge_index.detach().cpu().numpy()
 
     # Create adjacency list
     adj = {i: set() for i in range(num_nodes)}

@@ -10,12 +10,19 @@ from tqdm import tqdm
 from pydantic import BaseModel
 from argdantic import ArgParser
 
+import gurobipy as gp
 from gurobi_optimods.mwis import maximum_weighted_independent_set
 
 
 cli = ArgParser()
 
 
+def _make_silent_env() -> gp.Env:
+    env = gp.Env(empty=True)
+    env.setParam("OutputFlag", 0)
+    env.setParam("LogToConsole", 0)
+    env.start()
+    return env
 class MISProcessConfig(BaseModel):
     # output
     output_dir: str = "data/mis-10k"
@@ -60,7 +67,9 @@ def label_with_gurobi_mis(G: nx.Graph):
     n = G.number_of_nodes()
     weights = np.ones(n, dtype=float)
 
-    res = maximum_weighted_independent_set(G, weights)
+    res = maximum_weighted_independent_set(
+        G, weights, verbose=False, solver_params={"Threads": 1}
+    )
 
     y = np.zeros(n, dtype=np.int64)
     y[np.array(res.x, dtype=int)] = 1

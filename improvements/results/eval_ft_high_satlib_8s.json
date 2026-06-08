@@ -1,0 +1,45 @@
+{
+  "checkpoint": "checkpoints/mis_ft_high/epoch_49.pt",
+  "data_path": "data/difusco_benchmark/datasets/satlib/train",
+  "n_samples": 8,
+  "n_graphs": 249,
+  "elapsed_seconds": 388.1037495136261,
+  "results": {
+    "baseline_greedy": {
+      "mean": 0.9898277918931964,
+      "std": 0.004090327402553486,
+      "min": 0.9795918367346939,
+      "max": 1.0
+    },
+    "enhanced_greedy": {
+      "mean": 0.99265998233296,
+      "std": 0.00311212803138305,
+      "min": 0.981859410430839,
+      "max": 1.0
+    },
+    "multi_threshold": {
+      "mean": 0.99265998233296,
+      "std": 0.00311212803138305,
+      "min": 0.981859410430839,
+      "max": 1.0
+    },
+    "multisample_greedy": {
+      "mean": 0.9902011674817182,
+      "std": 0.003930961531350562,
+      "min": 0.9795918367346939,
+      "max": 1.0
+    },
+    "multisample_enhanced": {
+      "mean": 0.9930242511998105,
+      "std": 0.002978301774003435,
+      "min": 0.9841269841269841,
+      "max": 1.0
+    },
+    "multisample_multi_threshold": {
+      "mean": 0.9930242511998105,
+      "std": 0.002978301774003435,
+      "min": 0.9841269841269841,
+      "max": 1.0
+    }
+  }
+}
