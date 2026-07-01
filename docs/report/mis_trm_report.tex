@@ -21,8 +21,8 @@
 \newcommand{\ppar}{\mathrm{pp\text{-}AR}}
 
 \title{\vspace{-1.2cm}\textbf{Recurrent Reasoning Networks for the\\Maximum Independent Set Problem}}
-\author{Malik Mardan}
-\date{June 8, 2026}
+\author{Malik Mardan\\ \normalsize Matriculation number 3834310 \quad Study programme: Master Computer Science}
+\date{July 1, 2026}
 
 \begin{document}
 \maketitle
@@ -32,8 +32,7 @@
 Jolicoeur-Martineau et al., \emph{Less is More: Recursive Reasoning with Tiny
 Networks} (arXiv:2510.04871), from grid puzzles to graph problems. The idea of
 TRM is that a very small network, applied many times in a recurrent loop, can
-solve hard reasoning tasks that usually call for much larger models. We test
-whether that holds for the Maximum Independent Set problem.
+solve hard reasoning tasks that usually call for much larger models.
 Code: \url{https://github.com/73gon/trm-mis}.
 \normalsize
 
@@ -85,13 +84,13 @@ the KaMIS solver together with a positive-class weight $w$ ($w{=}1$ for the smal
 runs, $w{=}2$ for SATLIB, $w{=}5$ for the dense ER graphs). Optimisation uses AdamW
 (weight decay $0.05$), a OneCycle learning-rate schedule (peak $3\times10^{-4}$,
 $10\%$ warm-up, cosine decay), \texttt{bf16} precision, and dropout $0.15$, with
-early stopping on the held-out test loss.
+early stopping on the held-out validation loss.
 
 \paragraph{What the numbers mean.}
 \begin{itemize}\itemsep0.5pt
   \item \textbf{Iteration.} One gradient update on one mini-batch of graphs; ``$29$k
-    iterations'' means $29{,}000$ updates. We evaluate every $500$ iterations and
-    keep the best checkpoint, so runs stop at different counts.
+    iterations'' means $29{,}000$ updates. We evaluate on the validation set every
+    $500$ iterations and keep the best checkpoint, so runs stop at different counts.
   \item \textbf{Approximation ratio ($\ppar$).} The main quality metric. We decode
     the probabilities greedily (take nodes by probability, skip any neighbour of a
     chosen node) and report $|S_{\text{ours}}|/|S^\star|$; $1.0$ is optimal.
@@ -110,26 +109,33 @@ early stopping on the held-out test loss.
 
 We run two studies. The first is a controlled scaling study on
 Erd\H{o}s--R\'enyi (ER) graphs of fixed average degree $7.35$ at sizes
-$n\in\{50,100,200,300\}$, each with a held-out test split and exact Gurobi labels.
+$n\in\{50,100,200,300\}$, each with a held-out validation split (disjoint seeds)
+and exact Gurobi labels.
 The second uses two larger benchmarks from the DIFUSCO suite: SATLIB (SAT formulas
 turned into conflict graphs, around $1400$ nodes) and ER-700-800 (dense ER graphs
 of $700$ to $800$ nodes, average degree about $112$), both labelled by KaMIS.
+Every number below is measured on these held-out splits, never on training graphs
+(for the benchmarks this is the official DIFUSCO test split). Because the same
+split also drives early stopping and checkpoint selection, it serves as a
+validation set, so the reported best values are mildly optimistic. The splits hold
+$5000/5000/1000/300$ graphs for $n{=}50/100/200/300$ and $500$ graphs for each
+benchmark.
 
 \subsection{Scaling over problem size}
 
-On all four small sizes the model learns cleanly (Fig.~\ref{fig:small}). The test
-BCE drops from its random-init value near $0.73$ to between $0.23$ and $0.32$,
-while $\ppar$ climbs from about $0.886$ at initialisation to at least $0.98$. Larger
-graphs reach their best checkpoint in fewer iterations because each graph carries
-more signal, but they also start to overfit sooner since their training pools are
-smaller (Table~\ref{tab:main}). The model generalises rather than memorises: train
-and test graphs use disjoint random seeds.
+On all four small sizes the model learns cleanly (Fig.~\ref{fig:small}). The
+validation BCE drops from its random-init value near $0.73$ to between $0.23$ and
+$0.32$, while $\ppar$ climbs from about $0.886$ at initialisation to at least
+$0.98$. Larger graphs reach their best checkpoint in fewer iterations because each
+graph carries more signal, but they also start to overfit sooner since their
+training pools are smaller (Table~\ref{tab:main}).
 
 \begin{figure}[h]
   \centering
-  \includegraphics[width=0.66\linewidth]{small_mis_curves.png}
-  \caption{Held-out learning curves for the four small ER sizes. Left: test BCE
-  (lower is better). Right: approximation ratio $\ppar$ (higher is better).}
+  \includegraphics[width=0.60\linewidth]{small_mis_curves.png}
+  \caption{Held-out validation curves for the four small ER sizes. Left:
+  validation BCE (lower is better). Right: approximation ratio $\ppar$
+  (higher is better).}
   \label{fig:small}
 \end{figure}
 
@@ -138,9 +144,9 @@ and test graphs use disjoint random seeds.
 \small
 \caption{Main results. The top block is the small-ER scaling study; the bottom
 block is the two large benchmarks. $q$ is the average MIS fraction $|S^\star|/n$.
-``best BCE'' is the lowest test BCE over the run and ``best $\ppar$'' the highest
-test ratio; the two can occur at different checkpoints. Feasibility is $1.00$
-everywhere thanks to greedy decoding.}
+``best BCE'' is the lowest validation BCE over the run and ``best $\ppar$'' the
+highest validation ratio; the two can occur at different checkpoints. Feasibility
+is $1.00$ everywhere thanks to greedy decoding.}
 \label{tab:main}
 \begin{tabular}{lrrrrrrr}
 \toprule
@@ -171,9 +177,9 @@ contrast, depends only on the \emph{order} of the probabilities that the greedy
 decoder reads off: as long as good MIS nodes rank above the nodes that conflict
 with them, the decoded set is near optimal regardless of absolute calibration. The
 small ER runs avoid the mismatch because their multi-solution targets are
-calibrated, so they reach both a low BCE and a high ratio. In short, BCE tracks
-probability calibration against one labelling, $\ppar$ tracks set quality, and only
-$\ppar$ reflects the objective we actually care about.
+calibrated, so they reach both a low BCE and a high ratio. BCE therefore tracks
+calibration against one labelling while $\ppar$ tracks set quality, and only the
+latter reflects the objective we care about.
 
 \subsection{Confusion matrices}
 
@@ -215,11 +221,11 @@ prolonged training (Fig.~\ref{fig:satlib}). The approximation ratio peaks near
 $0.998$ around iteration $150$k and then slowly falls back to $0.95$, while the BCE
 climbs from $0.7$ to $1.8$. The model keeps fitting the single KaMIS labelling more
 aggressively, which hurts both calibration and, eventually, the decoded sets. Early
-stopping on the test score is therefore essential at this scale.
+stopping on the validation score is therefore essential at this scale.
 
 \begin{figure}[h]
   \centering
-  \includegraphics[width=0.66\linewidth]{satlib_n9000.png}
+  \includegraphics[width=0.60\linewidth]{satlib_n9000.png}
   \caption{SATLIB with a $9000$-graph pool. The ratio peaks near iteration $150$k
   and then degrades as the BCE rises, a clear overfitting signature.}
   \label{fig:satlib}
@@ -230,15 +236,16 @@ distribution: both attempts ran out of GPU memory on a $31.4$\,GB card inside th
 GIN message-passing step, before a single evaluation. The cause is the edge count,
 not the number of graphs. A dense ER graph of $750$ nodes has roughly $40$ times as
 many edges per node as a SATLIB conflict graph, so a batch of them produces a far
-larger message-passing tensor. The best completed result on this distribution comes
-from a smaller in-memory pool ($25{,}000$ graphs in smaller batches), which reaches
-$\ppar=0.903$, well above a degree-heuristic baseline of $0.60$ but clearly the
-hardest case we tried.
+larger message-passing tensor. Whether a run fits depends on how many dense graphs
+share one GPU batch, not on the pool size: the completed result on this distribution
+used a larger pool ($25{,}000$ graphs) but only $8$ graphs per batch instead of
+$16$, and reaches $\ppar=0.903$, well above a degree-heuristic baseline of $0.60$
+but clearly the hardest case we tried.
 
 %==========================================================================
 \section{Key insights}
 
-\begin{enumerate}\itemsep2pt
+\begin{enumerate}\itemsep1pt
   \item \textbf{The tiny recurrent network does learn MIS.} Every small-ER size
     reaches $\ppar$ between $0.98$ and $0.997$ on held-out graphs with a single
     $1.55$\,M model unrolled for $12$ steps, which supports the TRM premise that
@@ -263,7 +270,6 @@ hardest case we tried.
 \vspace{2pt}
 \noindent{\footnotesize\textit{Reproducibility.} All training, data-generation, and
 plotting code, the dataset specifications, and the configuration files are in the
-repository at \url{https://github.com/73gon/trm-mis}. The figures are regenerated by
-the plotting script from the training logs.\par}
+repository at \url{https://github.com/73gon/trm-mis}.\par}
 
 \end{document}
